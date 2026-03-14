@@ -1,4 +1,8 @@
+# MUST BE THE FIRST IMPORTS if using gevent in workers
 import os
+if os.environ.get("CELERY_WORKER_GEVENT") == "1":
+    from gevent import monkey
+    monkey.patch_all()
 from celery import Celery
 from dotenv import load_dotenv
 
@@ -19,10 +23,16 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="Asia/Kolkata",
     enable_utc=True,
-    task_soft_time_limit=25 * 60,  # 25 minutes
-    task_time_limit=30 * 60,       # 30 minutes
-    worker_concurrency=int(os.getenv("CELERY_WORKER_CONCURRENCY", "4")), # Optimized for 1 vCPU / 1 GB RAM tier
-    worker_prefetch_multiplier=1,  # Prevent workers from grabbing too many heavy tasks
-    task_acks_late=True,           # Task is acknowledged AFTER execution, ensuring it can be retried if worker dies
-    task_reject_on_worker_lost=True, # Reject task if worker process is killed
+    task_soft_time_limit=25 * 60,   # 25 minutes
+    task_time_limit=30 * 60,        # 30 minutes
+    # Note: With gevent, concurrency refers to greenlets, not processes.
+    worker_concurrency=int(os.getenv("CELERY_WORKER_CONCURRENCY", "50")), 
+    worker_prefetch_multiplier=10,   
+    task_acks_late=True,           
+    task_reject_on_worker_lost=True, 
+    task_routes={
+        "scraper.tasks.run_scrape_task": {"queue": "orchestrator"},
+        "scraper.tasks.scrape_article_node": {"queue": "scraper_nodes"},
+        "scraper.tasks.enrich_article_node": {"queue": "scraper_nodes"},
+    },
 )

@@ -308,6 +308,15 @@ async def discover_articles(keywords: List[str], day: date, geo: str, region_nam
 
 async def scrape_only(article: dict, job_id: str, sector: str, region: str, user_id: str) -> Optional[int]:
     """Extraction Node: Playwright I/O ONLY."""
+    # C-X: Skip RSS feeds that sometimes leak into Google News entries
+    if "/rss/" in article["url"] or "rss=1" in article["url"]:
+        log(f"Skipping RSS feed URL: {article['url']}")
+        # Increment progress even for skipped RSS
+        async with get_db() as db:
+            await db.execute(update(ScrapeJob).where(ScrapeJob.id == job_id).values(total_scraped=ScrapeJob.total_scraped + 1))
+            await db.commit()
+        return None
+
     try:
         url = article["url"]
         # Default date from discovery
@@ -423,6 +432,7 @@ async def scrape_only(article: dict, job_id: str, sector: str, region: str, user
             # C-6: Pre-screen URL with Redis to avoid UPSERT overhead
             r = await get_redis()
             SEEN_KEY = "nexus:seen_urls"
+            res = None
             if await r.sismember(SEEN_KEY, article["url"]):
                 log(f"Redis Cache Hit: Skipping UPSERT for {article['url'][:50]}")
                 # Still need to increment scraped count if we consider it "done" or just skip
@@ -447,7 +457,7 @@ async def scrape_only(article: dict, job_id: str, sector: str, region: str, user
                 log(f"Job {job_id} Fully Completed.")
 
             await db.commit()
-            return res.scalar()
+            return res.scalar() if res else None
     except Exception as e:
         log(f"Scrape failed for {article['url'][:30]}: {e}")
         return None

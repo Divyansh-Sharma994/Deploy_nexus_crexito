@@ -48,18 +48,21 @@ def main():
         shell=False
     )
 
-    print("[3/3] Starting Celery Worker...")
+    print("[3/3] Starting Celery Worker (gevent)...")
+    worker_env = env.copy()
+    worker_env["CELERY_WORKER_GEVENT"] = "1"
+    
     worker_proc = subprocess.Popen(
-        [python_exe, "-m", "celery", "-A", "celery_app", "worker", "--loglevel=info", "--pool=prefork"],
+        [python_exe, "-m", "celery", "-A", "celery_app", "worker", "--loglevel=info", "--pool=gevent", "--concurrency=50", "-Q", "orchestrator,scraper_nodes,celery"],
         cwd=backend_dir,
-        env=env
+        env=worker_env
     )
 
     print("\n=======================================")
     print(" NEXUS is running!")
     print(" Frontend: http://localhost:5173")
     print(" Backend:  http://localhost:8000")
-    print(" Worker:   Celery (prefork pool)")
+    print(" Worker:   Celery (gevent pool, all queues)")
     print(" Press Ctrl+C in this terminal to stop all.")
     print("=======================================\n")
 
