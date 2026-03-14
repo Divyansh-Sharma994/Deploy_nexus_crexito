@@ -21,7 +21,7 @@ celery_app.conf.update(
     enable_utc=True,
     task_soft_time_limit=25 * 60,  # 25 minutes
     task_time_limit=30 * 60,       # 30 minutes
-    worker_concurrency=2,          # Limit to 2 concurrent scrapes to save RAM
+    worker_concurrency=int(os.getenv("CELERY_WORKER_CONCURRENCY", "4")), # Optimized for 1 vCPU / 1 GB RAM tier
     worker_prefetch_multiplier=1,  # Prevent workers from grabbing too many heavy tasks
     task_acks_late=True,           # Task is acknowledged AFTER execution, ensuring it can be retried if worker dies
     task_reject_on_worker_lost=True, # Reject task if worker process is killed

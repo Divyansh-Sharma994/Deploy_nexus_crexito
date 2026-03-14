@@ -20,11 +20,12 @@ def get_database_url():
 engine = create_async_engine(
     get_database_url(),
     echo=False,
-    pool_size=10,
-    max_overflow=20,
+    pool_size=int(os.getenv("DB_POOL_SIZE", "50")),
+    max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "20")),
+    pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "30")),
     pool_recycle=3600,
     pool_pre_ping=True, # Critical for detecting stale connections
-    connect_args={"timeout": 30} if "sqlite" in get_database_url() else {}
+    connect_args={"timeout": 60} if "sqlite" in get_database_url() else {"command_timeout": 60}
 )
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 

@@ -11,6 +11,16 @@ GROQ_API_KEYS = [k.strip() for k in os.getenv("GROQ_API_KEY", "").split(",") if 
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "minimax-m2:cloud")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
+# --- Redis for Global Throttling (C-7) ---
+import redis.asyncio as redis
+_redis_client = None
+
+async def get_redis():
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
+    return _redis_client
+
 _ollama_semaphore = None
 def get_ollama_semaphore():
     global _ollama_semaphore
@@ -48,6 +58,19 @@ async def summarize_with_groq(text: str) -> Optional[str]:
 
     async with httpx.AsyncClient(timeout=30) as client:
         for attempt in range(3):
+            # C-7: Global Rate Limit Check (Redis-backed)
+            r = await get_redis()
+            GROQ_LIMIT_KEY = "nexus:groq_global_throttle"
+            req_count = await r.incr(GROQ_LIMIT_KEY)
+            if req_count == 1:
+                await r.expire(GROQ_LIMIT_KEY, 60) # 30 requests per 60 seconds
+            
+            if req_count > 30:
+                ttl = await r.ttl(GROQ_LIMIT_KEY)
+                log(f"Groq Global Rate Limit hit. Waiting {max(ttl, 1)}s...")
+                await asyncio.sleep(max(ttl, 1))
+                continue
+
             api_key = random.choice(GROQ_API_KEYS)
             headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
             try:
@@ -56,7 +79,7 @@ async def summarize_with_groq(text: str) -> Optional[str]:
                     return resp.json()["choices"][0]["message"]["content"]
                 elif resp.status_code == 429:
                     wait = 2 ** attempt
-                    log(f"Groq rate limited. Waiting {wait}s...")
+                    log(f"Groq 429 Error. Waiting {wait}s...")
                     await asyncio.sleep(wait)
                 else:
                     log(f"Groq API error: {resp.status_code}")

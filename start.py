@@ -50,7 +50,7 @@ def main():
 
     print("[3/3] Starting Celery Worker...")
     worker_proc = subprocess.Popen(
-        [python_exe, "-m", "celery", "-A", "celery_app", "worker", "--loglevel=info", "-P", "solo"],
+        [python_exe, "-m", "celery", "-A", "celery_app", "worker", "--loglevel=info", "--pool=prefork"],
         cwd=backend_dir,
         env=env
     )
@@ -59,7 +59,7 @@ def main():
     print(" NEXUS is running!")
     print(" Frontend: http://localhost:5173")
     print(" Backend:  http://localhost:8000")
-    print(" Worker:   Celery (solo pool)")
+    print(" Worker:   Celery (prefork pool)")
     print(" Press Ctrl+C in this terminal to stop all.")
     print("=======================================\n")
 

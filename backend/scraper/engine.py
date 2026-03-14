@@ -33,26 +33,63 @@ if sys.platform == 'win32':
     except:
         pass
 
-# --- Logging ---
+# --- Logging (D-6: JSON Logging) ---
 import logging
-from logging.handlers import RotatingFileHandler
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        log_entry = {
+            "time": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "msg": record.getMessage(),
+            "logger": record.name
+        }
+        if record.exc_info:
+            log_entry["exception"] = self.formatException(record.exc_info)
+        return json.dumps(log_entry)
+
+handler = logging.StreamHandler(sys.stderr)
+handler.setFormatter(JsonFormatter())
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s",
-    handlers=[
-        RotatingFileHandler("scraper.log", maxBytes=5*1024*1024, backupCount=5),
-        logging.StreamHandler(sys.stderr)
-    ]
+    handlers=[handler]
 )
 logger = logging.getLogger("ENGINE")
+
+# --- Exception Hierarchy (Remediation C-3) ---
+class NexusBaseError(Exception):
+    """Base exception for all NEXUS-specific errors."""
+    pass
+
+class ProxyFailureError(NexusBaseError):
+    """Raised when proxy authentication or connection fails (403/429)."""
+    pass
+
+class RateLimitError(NexusBaseError):
+    """Raised when external APIs (Groq, Google) rate limit the request."""
+    pass
+
+class ArticleFetchError(NexusBaseError):
+    """Raised when article content cannot be retrieved after retries."""
+    pass
 
 # --- Resource Pooling ---
 _browser_sem = None
 _shared_p = None
 _shared_browser = None
 _browser_lock = asyncio.Lock()
+_articles_processed = 0 # Counter for browser recycling (C-5)
 _proxies = []
+
+# --- Redis Cache (Remediation C-6) ---
+import redis.asyncio as redis
+_redis_client = None
+
+async def get_redis():
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
+    return _redis_client
 
 def load_proxies():
     global _proxies
@@ -69,12 +106,27 @@ def load_proxies():
                                 "username": parts[2],
                                 "password": parts[3]
                             })
+    
+    # D-5: Support rotating backconnect proxy URL
+    backconnect = os.getenv("WEBSHARE_PROXY_URL")
+    if backconnect:
+        # Expected format: http://user:pass@host:port
+        _proxies = [{"server": backconnect}]
+        log(f"PROXY: Using backconnect rotating proxy: {backconnect}")
+        
     return _proxies
 
 async def get_browser_instance():
-    """Global browser pooler to avoid overhead of launching chromium per article."""
-    global _shared_p, _shared_browser
+    """Global browser pooler with recycling logic (C-5)."""
+    global _shared_p, _shared_browser, _articles_processed
     async with _browser_lock:
+        # Recycle browser every 100 articles
+        if _shared_browser is not None and _articles_processed >= 100:
+            log(f"BROWSER: Recycling instance after {_articles_processed} articles.")
+            await _shared_browser.close()
+            _shared_browser = None
+            _articles_processed = 0
+
         if _shared_browser is None or not _shared_browser.is_connected():
             if _shared_p is None:
                 _shared_p = await async_playwright().start()
@@ -85,14 +137,16 @@ async def get_browser_instance():
             if proxies:
                 p = random.choice(proxies)
                 proxy_args["proxy"] = p
-                print(f"BROWSER: Launching with proxy {p['server']}")
+                log(f"BROWSER: Launching with proxy {p['server']}")
 
             _shared_browser = await _shared_p.chromium.launch(
                 headless=True,
                 args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
                 **proxy_args
             )
-            print("BROWSER: Shared instance launched.")
+            log("BROWSER: Shared instance launched.")
+        
+        _articles_processed += 1
         return _shared_browser
 
 async def shutdown_browser():
@@ -219,9 +273,13 @@ async def discover_articles(keywords: List[str], day: date, geo: str, region_nam
                             })
                         if batch_entries > 0:
                             log(f"  [Window {start_time}] Found {batch_entries} articles for '{q}'")
-                    elif resp.status_code == 503:
-                        log(f"  [Window {start_time}] 503 Error for '{q}'. Proxy might be throttled.")
-                        await asyncio.sleep(5)
+                    elif resp.status_code in [403, 429, 503]:
+                        log(f"  [Window {start_time}] Proxy/Rate limit error ({resp.status_code}) for '{q}'")
+                        raise ProxyFailureError(f"HTTP {resp.status_code}")
+                    else:
+                        resp.raise_for_status()
+                except ProxyFailureError:
+                    raise
                 except Exception as e:
                     log(f"Discovery Error for {q}: {e}")
             
@@ -293,6 +351,10 @@ async def scrape_only(article: dict, job_id: str, sector: str, region: str, user
                 await page.wait_for_timeout(1000)
                 html = await page.content()
                 
+                # C-3: Detect proxy deaths/silent failures in browser
+                if "403 Forbidden" in html or "429 Too Many Requests" in html or "Access Denied" in html:
+                    raise ProxyFailureError("Browser detected block page")
+
                 body = extract_body(html)
                 author = extract_author(html)
                 
@@ -358,7 +420,17 @@ async def scrape_only(article: dict, job_id: str, sector: str, region: str, user
                     set_={"full_body": text("excluded.full_body"), "scrape_job_id": text("excluded.scrape_job_id"), "author": text("excluded.author"), "published_at": text("excluded.published_at")}
                 ).returning(Article.id)
             
-            res = await db.execute(stmt)
+            # C-6: Pre-screen URL with Redis to avoid UPSERT overhead
+            r = await get_redis()
+            SEEN_KEY = "nexus:seen_urls"
+            if await r.sismember(SEEN_KEY, article["url"]):
+                log(f"Redis Cache Hit: Skipping UPSERT for {article['url'][:50]}")
+                # Still need to increment scraped count if we consider it "done" or just skip
+                # Let's say we just skip for performance
+            else:
+                res = await db.execute(stmt)
+                await r.sadd(SEEN_KEY, article["url"])
+                await r.expire(SEEN_KEY, 86400) # 24h TTL
             
             # Real-time Progress Tracking
             await db.execute(
@@ -454,24 +526,27 @@ async def run_scrape_job(job_id: str, sector: str, region: str, date_from: date,
         # However, we will respect the input but log it clearly.
         log(f"Discovery Window: {date_from} to {date_to} ({region}, {geo})")
         
+        # Parallel Discovery (C-2)
+        dates = []
         curr = date_from
         while curr <= date_to:
-            log(f"Searching for articles published on: {curr}")
-            discovered = await discover_articles(keywords, curr, geo, region, job_id, cumulative)
-            all_discovered.extend(discovered)
-            
-            # Update progress in DB real-time
-            await db.execute(
-                update(ScrapeJob)
-                .where(ScrapeJob.id == job_id)
-                .values(cumulative_found=len(cumulative))
-            )
-            await db.commit()
-            
+            dates.append(curr)
             curr += timedelta(days=1)
-            # Safety: If we are in a long loop, add a small delay between days
-            if curr <= date_to:
-                await asyncio.sleep(2)
+        
+        log(f"Parallelizing discovery across {len(dates)} days...")
+        discovery_tasks = [discover_articles(keywords, d, geo, region, job_id, cumulative) for d in dates]
+        results = await asyncio.gather(*discovery_tasks)
+        
+        for discovered_on_day in results:
+            all_discovered.extend(discovered_on_day)
+            
+        # Update final found count in DB
+        await db.execute(
+            update(ScrapeJob)
+            .where(ScrapeJob.id == job_id)
+            .values(cumulative_found=len(cumulative))
+        )
+        await db.commit()
 
         await update_phase_status(db, job_id, phase_name, "completed")
         

@@ -159,10 +159,46 @@ def root():
 
 @app.get("/health")
 async def health():
+    """Enterprise Health Check (D-3)."""
     try:
+        from scraper.engine import get_browser_instance, get_redis
+        
+        # 1. Check DB
+        db_start = time.time()
         async with get_db() as db:
             res = await db.execute(select(func.count(Article.id)))
             count = res.scalar()
-        return {"status": "healthy", "total_articles": count}
+        db_ms = int((time.time() - db_start) * 1000)
+
+        # 2. Check Redis
+        redis_start = time.time()
+        r = await get_redis()
+        await r.ping()
+        redis_ms = int((time.time() - redis_start) * 1000)
+
+        # 3. Warm-up Browser
+        browser_start = time.time()
+        browser = await get_browser_instance()
+        browser_ok = browser is not None and browser.is_connected()
+        browser_ms = int((time.time() - browser_start) * 1000)
+
+        return {
+            "status": "healthy" if browser_ok else "degraded",
+            "uptime": "TODO", # Add uptime logic if needed
+            "total_articles": count,
+            "latency_ms": {
+                "database": db_ms,
+                "redis": redis_ms,
+                "browser": browser_ms
+            },
+            "services": {
+                "redis": "connected",
+                "browser": "ready" if browser_ok else "failed"
+            }
+        }
     except Exception as e:
-        return {"status": "degraded", "error": str(e)}
+        logger.error(f"Health check failed: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unhealthy", "error": str(e)}
+        )
