@@ -376,6 +376,8 @@ async def scrape_only(article: dict, job_id: str, sector: str, region: str, user
                     viewport={'width': 1280, 'height': 720}
                 )
                 page = await context.new_page()
+                # Bandwidth Optimization: Abort non-essential assets (images, css, fonts)
+                await page.route("**/*.{png,jpg,gif,css,woff,woff2}", lambda route: route.abort())
                 await Stealth().apply_stealth_async(page)
                 
                 # Phase 1: Navigation
