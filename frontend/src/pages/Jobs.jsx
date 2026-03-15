@@ -107,8 +107,9 @@ export default function Jobs() {
     } catch { }
   };
 
-  const activeCount = jobs.filter((j) => j.status === "running" || j.status === "pending").length;
-  const totalArticles = jobs.reduce((sum, j) => sum + (j.total_scraped || 0), 0);
+  const safeJobs = Array.isArray(jobs) ? jobs : [];
+  const activeCount = safeJobs.filter((j) => j.status === "running" || j.status === "pending").length;
+  const totalArticles = safeJobs.reduce((sum, j) => sum + (j.total_scraped || 0), 0);
 
   return (
     <div>
@@ -131,7 +132,7 @@ export default function Jobs() {
         <div className="stat-card">
           <div className="stat-label">Success Rate</div>
           <div className="stat-value">
-            {jobs.length > 0 ? Math.round((jobs.filter(j => j.status === 'completed').length / jobs.length) * 100) : 0}%
+            {safeJobs.length > 0 ? Math.round((safeJobs.filter(j => j.status === 'completed').length / safeJobs.length) * 100) : 0}%
           </div>
           <div className="stat-sub">Reliability Metric</div>
         </div>

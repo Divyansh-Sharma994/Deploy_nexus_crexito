@@ -25,10 +25,12 @@ const useStore = create((set, get) => ({
 
   fetchJobs: async () => {
     try {
-      const jobs = await api.get('/scrape/jobs');
-      set({ jobs });
+      const data = await api.get('/scrape/jobs');
+      // Ensure jobs is always an array for UI stability
+      set({ jobs: Array.isArray(data) ? data : [] });
     } catch (err) {
       console.error('Jobs fetch failed:', err);
+      set({ jobs: [] });
     }
   },
 
@@ -36,9 +38,12 @@ const useStore = create((set, get) => ({
     set({ loading: true });
     try {
       const data = await api.get('/articles/', params);
+      // Defensive checks for production stability
+      const safeArticles = Array.isArray(data.articles) ? data.articles : [];
+      const safeTotal = typeof data.total === 'number' ? data.total : 0;
       set({ 
-        articles: data.articles, 
-        totalArticles: data.total,
+        articles: safeArticles, 
+        totalArticles: safeTotal,
         loading: false 
       });
     } catch (err) {

@@ -147,7 +147,8 @@ export default function BrandTracker({ onNavigate }) {
     };
 
     const filteredBrands = useMemo(() => {
-        return brands.filter(b => b.name.toLowerCase().includes(search.toLowerCase()));
+        const safeBrands = Array.isArray(brands) ? brands : [];
+        return safeBrands.filter(b => b && b.name && b.name.toLowerCase().includes(search.toLowerCase()));
     }, [brands, search]);
 
     return (

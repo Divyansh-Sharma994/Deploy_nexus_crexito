@@ -65,7 +65,7 @@ function ThemeToggle() {
 function ProtectedApp() {
   const { user, loading, logout } = useAuth();
   const [page, setPage] = useState("dashboard");
-  const { fetchStats, fetchJobs } = useStore();
+  const { stats, jobs, fetchStats, fetchJobs } = useStore();
   const [apiStatus, setApiStatus] = useState("checking");
 
   useEffect(() => {
@@ -103,7 +103,9 @@ function ProtectedApp() {
   if (!user) return <Navigate to="/login" />;
 
   // Defensive array check for production robustness
-  const activeJobs = Array.isArray(jobs) ? jobs.filter(j => j.status === 'running' || j.status === 'pending') : [];
+  const safeJobs = Array.isArray(jobs) ? jobs : [];
+  const activeCount = safeJobs.filter((j) => j.status === "running" || j.status === "pending").length;
+  const totalArticles = safeJobs.reduce((sum, j) => sum + (j.total_scraped || 0), 0);
   const statusColor = apiStatus === "online" ? "var(--success)" : "var(--danger)";
 
   return (
