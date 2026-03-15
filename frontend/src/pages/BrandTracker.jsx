@@ -1,5 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
-import { getHeaders } from "../utils/apiUtils";
+import { api } from "../services/api";
 
 export default function BrandTracker({ onNavigate }) {
     const [brands, setBrands] = useState([]);
@@ -30,8 +29,7 @@ export default function BrandTracker({ onNavigate }) {
 
     const fetchBrands = async () => {
         try {
-            const res = await fetch("/api/brands/", { headers: getHeaders() });
-            const data = await res.json();
+            const data = await api.get("/brands/");
             setBrands(Array.isArray(data) ? data : []);
         } catch (err) {
             console.error("Failed to fetch brands", err);
@@ -41,41 +39,26 @@ export default function BrandTracker({ onNavigate }) {
     const addBrand = async () => {
         if (!newBrand.trim()) return;
         try {
-            const res = await fetch("/api/brands/", {
-                method: "POST",
-                headers: getHeaders(),
-                body: JSON.stringify({ 
-                    name: newBrand.trim(),
-                    keywords: newKeywords.trim() || null,
-                    region: newRegion
-                }),
+            await api.post("/brands/", { 
+                name: newBrand.trim(),
+                keywords: newKeywords.trim() || null,
+                region: newRegion
             });
-            if (res.ok) {
-                setNewBrand("");
-                setNewKeywords("");
-                fetchBrands();
-                setMsg({ type: "success", text: "Brand added to watchlist." });
-            } else {
-                const err = await res.json();
-                setMsg({ type: "error", text: err.detail || "Failed to add brand" });
-            }
+            setNewBrand("");
+            setNewKeywords("");
+            fetchBrands();
+            setMsg({ type: "success", text: "Brand added to watchlist." });
         } catch (err) {
-            setMsg({ type: "error", text: "Connection error" });
+            setMsg({ type: "error", text: err.message || "Failed to add brand" });
         }
     };
 
     const updateBrandNode = async (name, keywords, region) => {
         try {
-            const res = await fetch(`/api/brands/${encodeURIComponent(name)}`, {
-                method: "PUT",
-                headers: getHeaders(),
-                body: JSON.stringify({ name, keywords, region }),
-            });
-            if (res.ok) {
-                setEditingBrand(null);
-                fetchBrands();
-                setMsg({ type: "success", text: "Brand configuration updated." });
-            }
+            await api.put(`/brands/${encodeURIComponent(name)}`, { name, keywords, region });
+            setEditingBrand(null);
+            fetchBrands();
+            setMsg({ type: "success", text: "Brand configuration updated." });
         } catch (err) {
             console.error(err);
         }
@@ -97,10 +80,7 @@ export default function BrandTracker({ onNavigate }) {
     const deleteBrand = async (name) => {
         if (!window.confirm(`Stop tracking ${name}?`)) return;
         try {
-            await fetch(`/api/brands/${encodeURIComponent(name)}`, { 
-                method: "DELETE",
-                headers: getHeaders()
-            });
+            await api.delete(`/brands/${encodeURIComponent(name)}`);
             fetchBrands();
         } catch (err) {
             console.error(err);
@@ -111,18 +91,10 @@ export default function BrandTracker({ onNavigate }) {
         setLoading(true);
         setMsg(null);
         try {
-            const res = await fetch(`/api/brands/scrape?days=${days}`, { 
-                method: "POST",
-                headers: getHeaders()
-            });
-            const data = await res.json();
-            if (res.ok) {
-                setMsg({ type: "success", text: `Scrape mission initiated for ${brands.length} brands.` });
-            } else {
-                setMsg({ type: "error", text: data.detail || "Failed to start scrape" });
-            }
+            const data = await api.post(`/brands/scrape?days=${days}`);
+            setMsg({ type: "success", text: `Scrape mission initiated for ${brands.length} brands.` });
         } catch (err) {
-            setMsg({ type: "error", text: "Connection error" });
+            setMsg({ type: "error", text: err.message || "Failed to start scrape" });
         } finally {
             setLoading(false);
         }
@@ -131,18 +103,10 @@ export default function BrandTracker({ onNavigate }) {
     const startIndividualScrape = async (name) => {
         setMsg(null);
         try {
-            const res = await fetch(`/api/brands/scrape/${encodeURIComponent(name)}?days=${days}`, { 
-                method: "POST",
-                headers: getHeaders()
-            });
-            const data = await res.json();
-            if (res.ok) {
-                setMsg({ type: "success", text: `Scrape initiated for ${name}.` });
-            } else {
-                setMsg({ type: "error", text: data.detail || "Failed to start scrape" });
-            }
+            await api.post(`/brands/scrape/${encodeURIComponent(name)}?days=${days}`);
+            setMsg({ type: "success", text: `Scrape initiated for ${name}.` });
         } catch (err) {
-            setMsg({ type: "error", text: "Connection error" });
+            setMsg({ type: "error", text: err.message || "Failed to start scrape" });
         }
     };
 

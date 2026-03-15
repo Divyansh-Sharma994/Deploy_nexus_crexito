@@ -1,5 +1,4 @@
-import { useState, useEffect } from "react";
-import { getHeaders } from "../utils/apiUtils";
+import { api } from "../services/api";
 
 export default function Diagnostics() {
     const [data, setData] = useState(null);
@@ -7,8 +6,7 @@ export default function Diagnostics() {
 
     const fetchDiagnostics = async () => {
         try {
-            const res = await fetch("/api/diagnostics/health", { headers: getHeaders() });
-            const json = await res.json();
+            const json = await api.get("/diagnostics/health");
             setData(json);
         } catch (e) {
             console.error(e);

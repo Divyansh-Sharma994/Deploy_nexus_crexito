@@ -49,6 +49,7 @@ apiClient.interceptors.response.use(
 export const api = {
   get: (url, params) => apiClient.get(url, { params }),
   post: (url, data) => apiClient.post(url, data),
+  put: (url, data) => apiClient.put(url, data),
   delete: (url) => apiClient.delete(url),
   
   // Helper for direct URLs

@@ -1,5 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
-import { getHeaders } from "../utils/apiUtils";
+import { api } from "../services/api";
 
 export default function NewScrape({ onNavigate }) {
   const [options, setOptions] = useState({ sectors: [], regions: [] });
@@ -15,8 +14,7 @@ export default function NewScrape({ onNavigate }) {
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    fetch("/api/scrape/options", { headers: getHeaders() })
-      .then(res => res.json())
+    api.get("/scrape/options")
       .then(setOptions)
       .catch(() => { });
   }, []);
@@ -42,17 +40,8 @@ export default function NewScrape({ onNavigate }) {
     setError(null);
     setResult(null);
     try {
-      const res = await fetch("/api/scrape/start", {
-        method: "POST",
-        headers: getHeaders(),
-        body: JSON.stringify(form)
-      });
-      const data = await res.json();
-      if (res.ok) {
-        setResult(data);
-      } else {
-        setError(data.detail || "Mission initiation failed");
-      }
+      const data = await api.post("/scrape/start", form);
+      setResult(data);
     } catch (e) {
       setError("Network or connection variance detected.");
     } finally {
