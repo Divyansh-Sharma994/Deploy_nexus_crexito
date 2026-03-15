@@ -97,36 +97,37 @@ def load_proxies():
         # Static files
         for fname in ["webshare_proxies.txt", "Webshare 10 proxies.txt"]:
             fpath = os.path.join(os.path.dirname(__file__), "..", fname)
-            if os.path.exists(fpath):
-                with open(fpath, "r") as f:
-                    for line in f:
-                        parts = line.strip().split(":")
-                        if len(parts) == 4:
-                            # Standardized as full URL strings
-                            _proxies.append(f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}")
     
-    # Backconnect gateway (Railway requirement)
-    backconnect = os.getenv("WEBSHARE_PROXY_URL")
-    if backconnect:
-        # If the URL is just a token, try to build a full webshare proxy URL
-        if "." not in backconnect and ":" not in backconnect:
-             user = os.getenv("WEBSHARE_PROXY_USER", "bqvqvpiu")
-             pw = os.getenv("WEBSHARE_PROXY_PASS", "5dkv4trtt7x7")
-             backconnect = f"http://{user}:{pw}@p.webshare.io:80"
-             log(f"PROXY: Detected token-only gateway. Reconstructed URL.")
-        elif "@" not in backconnect and os.getenv("WEBSHARE_PROXY_USER"):
-            user = os.getenv("WEBSHARE_PROXY_USER")
-            pw = os.getenv("WEBSHARE_PROXY_PASS")
-            backconnect = f"http://{user}:{pw}@{backconnect.replace('http://', '')}"
-        
-        if not backconnect.startswith("http"):
-            backconnect = f"http://{backconnect}"
+    # 1. Load from proxy text file if present
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    fpath = os.path.join(base_dir, "Webshare 10 proxies.txt")
+    if os.path.exists(fpath):
+        with open(fpath, "r") as f:
+            for line in f:
+                parts = line.strip().split(":")
+                if len(parts) == 4:
+                    _proxies.append(f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}")
+    
+    # 2. Append dynamically generated rotating proxies from Dashboard pattern
+    user_base = os.getenv("WEBSHARE_PROXY_USER")
+    pw = os.getenv("WEBSHARE_PROXY_PASS")
+    if user_base and pw:
+        # Generate 1-10 indices as shown in dashboard screenshot
+        for i in range(1, 11):
+            _proxies.append(f"http://{user_base}-{i}:{pw}@p.webshare.io:80")
             
-        _proxies = [backconnect]
-        log(f"PROXY: Using backconnect rotating gateway: {backconnect}")
-    
+    # 3. Legacy ENV check
+    backconnect = os.getenv("WEBSHARE_PROXY_URL")
+    if backconnect and backconnect not in "".join(_proxies):
+        if "." not in backconnect and ":" not in backconnect:
+             backconnect = f"http://{user_base or 'jxgqvosn'}:{pw or 'symou02ck2bw'}@p.webshare.io:80"
+        _proxies.append(backconnect)
+
+    _proxies = list(dict.fromkeys(_proxies)) # Deduplicate
     if not _proxies:
         log("WARNING: No proxies loaded. Scraper will use direct connection.")
+    else:
+        log(f"PROXY: Initialized pool with {len(_proxies)} gateways.")
         
     return _proxies
 
@@ -226,16 +227,14 @@ async def is_job_cancelled(job_id: str) -> bool:
 # ─── Discovery Phase ──────────────────────────────────────────────────────────
 
 async def discover_articles(keywords: List[str], day: date, geo: str, region_name: str, job_id: str, cumulative: set = None) -> List[dict]:
-    """Hyper-Scale Discovery via Google News RSS Loop with 3-Hour Granular Windows."""
+    """Hyper-Scale Discovery via Google News RSS Loop with 3-Hour Granular Windows and Proxy Rotation."""
     from scraper.config import SEARCH_MODIFIERS, REGION_MAP
     articles = []
     seen_urls = set()
     
-    # Identify cities for local targeting
     region_data = REGION_MAP.get(region_name.lower(), {"geo": "US", "cities": []})
     cities = region_data.get("cities", [])
     
-    # Generate 3-hour windows (8 blocks per day)
     windows = [
         ("00:00:00", "03:00:00"), ("03:00:00", "06:00:00"), 
         ("06:00:00", "09:00:00"), ("09:00:00", "12:00:00"),
@@ -244,98 +243,88 @@ async def discover_articles(keywords: List[str], day: date, geo: str, region_nam
     ]
 
     log(f"Starting 3-hour granular discovery for {day} ({region_name})")
-    proxies_list = load_proxies()
+    
+    # 1. Prepare global proxy pool once
+    proxy_pool = load_proxies()
+    if not proxy_pool:
+        proxy_pool = [None]
+    
+    async def fetch_rss_with_rotation(q, start_time, end_time, attempt=0):
+        if await is_job_cancelled(job_id):
+            return
+
+        # Explicitly rotate proxy from pool for each attempt
+        current_proxy = proxy_pool[attempt % len(proxy_pool)]
+        
+        async with httpx.AsyncClient(timeout=35, follow_redirects=True, proxy=current_proxy) as client:
+            full_after = f"{day.isoformat()}T{start_time}"
+            full_before = f"{day.isoformat()}T{end_time}"
+            domain = REGION_MAP.get(geo, "google.com")
+            rss_url = f"https://news.{domain}/rss/search?q={quote_plus(q)}&hl=en-IN&gl=IN&ceid=IN:en&start={full_after}&end={full_before}"
+            
+            try:
+                resp = await client.get(rss_url, headers={"User-Agent": random.choice(USER_AGENTS)})
+                
+                if resp.status_code in [407, 403, 429]:
+                    if attempt < 3:
+                        log(f"  [Discovery] Proxy/Rate Limit ({resp.status_code}) for '{q}'. Rotating.")
+                        await asyncio.sleep(random.uniform(1, 3))
+                        return await fetch_rss_with_rotation(q, start_time, end_time, attempt + 1)
+                    raise ProxyFailureError(f"HTTP {resp.status_code}")
+
+                if resp.status_code == 200:
+                    feed = feedparser.parse(resp.text)
+                    batch_entries = 0
+                    for e in feed.entries:
+                        link = e.get("link")
+                        if not link or link in seen_urls: continue
+                        seen_urls.add(link)
+                        batch_entries += 1
+                        
+                        pub_date_str = day.isoformat()
+                        if "published_parsed" in e:
+                            try:
+                                dt = datetime(*e.published_parsed[:6])
+                                pub_date_str = dt.isoformat()
+                            except: pass
+                        
+                        articles.append({
+                            "title": e.get("title", ""),
+                            "url": link,
+                            "published_at": pub_date_str, 
+                            "agency": e.get("source", {}).get("title", ""),
+                        })
+                    return # Success
+                else:
+                    resp.raise_for_status()
+
+            except Exception as exc:
+                if attempt < 2:
+                    return await fetch_rss_with_rotation(q, start_time, end_time, attempt + 1)
+                log(f"Discovery fail for '{q}': {str(exc)[:50]}")
 
     for start_t, end_t in windows:
+        if await is_job_cancelled(job_id): break
         log(f"Processing 3-hour window: {start_t} to {end_t}")
         
-        # Select proxy for this window to spread load
-        proxy_url = None
-        if proxies_list:
-            proxy_url = random.choice(proxies_list)
-            log(f"  [Window {start_t}] Using randomized proxy gateway.")
+        # Expand queries for this window
+        window_queries = []
+        for kw in keywords:
+            window_queries.append(kw)
+            for mod in random.sample(SEARCH_MODIFIERS, min(len(SEARCH_MODIFIERS), 5)):
+                window_queries.append(f"{kw} {mod}")
+            if cities:
+                for city in random.sample(cities, min(len(cities), 2)):
+                    window_queries.append(f"{kw} {city}")
 
-        async with httpx.AsyncClient(
-            timeout=30, 
-            follow_redirects=True,
-            proxy=proxy_url if proxy_url else None
-        ) as client:
-            async def fetch_rss(q, start_time, end_time, retry_count=0):
-                if await is_job_cancelled(job_id):
-                    return
-
-                full_after = f"{day.isoformat()}T{start_time}"
-                full_before = f"{day.isoformat()}T{end_time}"
-                
-                # C-X: Use region-specific domain
-                domain = REGION_MAP.get(geo, "google.com")
-                rss_url = f"https://news.{domain}/rss/search?q={quote_plus(q)}&hl=en-IN&gl=IN&ceid=IN:en&start={full_after}&end={full_before}"
-                
-                try:
-                    resp = await client.get(rss_url, headers={"User-Agent": random.choice(USER_AGENTS)})
-                    if resp.status_code == 429:
-                        raise Exception("Rate limited by Google News")
-                    
-                    if resp.status_code == 200:
-                        feed = feedparser.parse(resp.text)
-                        batch_entries = 0
-                        for e in feed.entries:
-                            link = e.get("link")
-                            if not link or link in seen_urls: continue
-                            seen_urls.add(link)
-                            batch_entries += 1
-                            
-                            pub_date_str = day.isoformat()
-                            if "published_parsed" in e:
-                                try:
-                                    dt = datetime(*e.published_parsed[:6])
-                                    pub_date_str = dt.isoformat()
-                                except: pass
-                            elif "published" in e:
-                                pub_date_str = e.published
-    
-                            articles.append({
-                                "title": e.get("title", ""),
-                                "url": link,
-                                "published_at": pub_date_str, 
-                                "agency": e.get("source", {}).get("title", ""),
-                            })
-                        if batch_entries > 0:
-                            log(f"  [Window {start_time}] Found {batch_entries} articles for '{q}'")
-                    elif resp.status_code in [403, 429, 503]:
-                        log(f"  [Window {start_time}] Proxy/Rate limit error ({resp.status_code}) for '{q}'")
-                        raise ProxyFailureError(f"HTTP {resp.status_code}")
-                    else:
-                        resp.raise_for_status()
-                except Exception as e:
-                    if retry_count < 2:
-                        wait_sec = (retry_count + 1) * 3 + random.uniform(1, 4)
-                        log(f"  [Window {start_time}] Discovery Retry {retry_count+1} for '{q}' due to {e}")
-                        await asyncio.sleep(wait_sec)
-                        return await fetch_rss(q, start_time, end_time, retry_count + 1)
-                    else:
-                        log(f"Discovery failed for {q} after 3 attempts: {e}")
-            
-            # Construct query list for this window
-            window_queries = []
-            for kw in keywords:
-                window_queries.append(kw)
-                for mod in random.sample(SEARCH_MODIFIERS, min(len(SEARCH_MODIFIERS), 10)):
-                    window_queries.append(f"{kw} {mod}")
-                if cities:
-                    for city in random.sample(cities, min(len(cities), 3)):
-                        window_queries.append(f"{kw} {city}")
-
-            # Process window queries in small parallel batches
-            batch_size = 5
-            for i in range(0, len(window_queries), batch_size):
-                if await is_job_cancelled(job_id):
-                    log(f"Job {job_id} Cancelled. Stopping discovery.")
-                    return articles
-                    
-                batch = window_queries[i:i+batch_size]
-                await asyncio.gather(*[fetch_rss(q, start_t, end_t) for q in batch])
-                await asyncio.sleep(random.uniform(1, 4))
+        # Process in batches of 5 to avoid overloading
+        random.shuffle(window_queries)
+        for i in range(0, len(window_queries), 5):
+            if await is_job_cancelled(job_id): break
+            batch = window_queries[i:i+5]
+            tasks = [fetch_rss_with_rotation(q, start_t, end_t) for q in batch]
+            await asyncio.gather(*tasks)
+            await asyncio.sleep(random.uniform(0.5, 1.5))
 
     log(f"Completed discovery for {day}. Unique articles found: {len(seen_urls)}")
     if cumulative is not None: cumulative.update(seen_urls)
