@@ -27,4 +27,5 @@ RUN playwright install-deps chromium
 COPY backend/ .
 
 # Default command: Production-grade Uvicorn with workers
-CMD ["gunicorn", "main:app", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000", "--timeout", "120"]
+# Using shell form to support $PORT expansion from Railway
+CMD gunicorn main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 120
