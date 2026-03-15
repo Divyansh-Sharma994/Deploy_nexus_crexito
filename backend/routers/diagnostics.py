@@ -102,3 +102,47 @@ async def get_system_health():
     _diag_cache["data"] = res
     _diag_cache["timestamp"] = now
     return res
+
+@router.post("/emergency-stop")
+async def emergency_stop():
+    """Aggressively halt all background activity and clear queues."""
+    results = {"actions": []}
+    
+    # 1. Purge Queues
+    try:
+        purged = celery_app.control.purge()
+        results["actions"].append(f"Purged {purged} tasks from queues")
+    except Exception as e:
+        results["actions"].append(f"Purge failed: {e}")
+
+    # 2. Revoke active tasks
+    try:
+        celery_app.control.revoke("all", terminate=True)
+        results["actions"].append("Sent broadcast revoke to all workers")
+    except Exception as e:
+        results["actions"].append(f"Revoke failed: {e}")
+
+    # 3. DB Cleanup
+    try:
+        async with get_db() as db:
+            from sqlalchemy import update
+            stmt = (
+                update(ScrapeJob)
+                .where(ScrapeJob.status.in_(['running', 'pending']))
+                .values(status='interrupted', error='Emergency stop triggered')
+            )
+            await db.execute(stmt)
+            await db.commit()
+            results["actions"].append("Marked active jobs as interrupted in DB")
+    except Exception as e:
+        results["actions"].append(f"DB update failed: {e}")
+
+    # 4. Clear Cancelled Set in Redis (Cleanup)
+    try:
+        from scraper.llm import get_redis
+        r = await get_redis()
+        await r.delete("nexus:cancelled_jobs")
+        results["actions"].append("Cleared cancellation registry")
+    except: pass
+
+    return {"status": "success", "results": results}
