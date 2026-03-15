@@ -137,12 +137,14 @@ async def emergency_stop():
     except Exception as e:
         results["actions"].append(f"DB update failed: {e}")
 
-    # 4. Clear Cancelled Set in Redis (Cleanup)
+    # 4. Global Kill Switch in Redis
     try:
         from scraper.llm import get_redis
         r = await get_redis()
-        await r.delete("nexus:cancelled_jobs")
-        results["actions"].append("Cleared cancellation registry")
-    except: pass
+        # Set a 10-minute global stop to allow workers to exit cleanly
+        await r.set("nexus:global_stop", "1", ex=600)
+        results["actions"].append("Triggered 10-minute GLOBAL STOP flag")
+    except Exception as e:
+        results["actions"].append(f"Global stop flag failed: {e}")
 
     return {"status": "success", "results": results}

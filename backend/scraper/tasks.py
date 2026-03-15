@@ -125,6 +125,12 @@ def enrich_article_node(self, article_id):
             if not article or not article.full_body:
                 return
             
+            # C-X: Check for cancellation before AI compute
+            from scraper.engine import is_job_cancelled
+            if await is_job_cancelled(article.scrape_job_id):
+                logger.info(f"Enrichment cancelled for job {article.scrape_job_id}. Skipping article {article_id}")
+                return
+
             # 2. Run AI Logic
             try:
                 enriched_data = await perform_full_enrichment(article.full_body, article.title, article.url, article.sector)

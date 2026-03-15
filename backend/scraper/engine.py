@@ -235,10 +235,14 @@ async def update_phase_status(db, job_id, phase_name, status):
         log(f"Error updating phase status: {e}")
 
 async def is_job_cancelled(job_id: str) -> bool:
-    """Check if the job has been flagged for cancellation in Redis."""
+    """Check if the job (or whole system) has been flagged for cancellation in Redis."""
     from scraper.llm import get_redis
     try:
         r = await get_redis()
+        # 1. Check Global Kill Switch
+        if await r.get("nexus:global_stop"):
+            return True
+        # 2. Check Specific Job
         return await r.sismember("nexus:cancelled_jobs", job_id)
     except:
         return False
@@ -662,6 +666,11 @@ async def run_scrape_job(job_id: str, sector: str, region: str, date_from: date,
         # Dispatch Celery
         from scraper.tasks import scrape_article_node
         for a in all_discovered:
+            # C-X: Emergency Stop check inside the loop
+            if await is_job_cancelled(job_id):
+                log(f"Orchestrator halting dispatch for {job_id} due to cancellation.")
+                break
+            
             # Ensure brand_name is passed for filtering in scrape_only
             a["brand_name"] = sector if sector != "brand_tracker" else None
             scrape_article_node.delay(a, job_id, sector, region, user_id)
