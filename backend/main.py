@@ -3,6 +3,7 @@ import sys
 import os
 import time
 import warnings
+print("NEXUS: Application Preflight Initialization Started...")
 from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 
