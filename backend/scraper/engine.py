@@ -108,7 +108,13 @@ def load_proxies():
     # Backconnect gateway (Railway requirement)
     backconnect = os.getenv("WEBSHARE_PROXY_URL")
     if backconnect:
-        if "@" not in backconnect and os.getenv("WEBSHARE_PROXY_USER"):
+        # If the URL is just a token, try to build a full webshare proxy URL
+        if "." not in backconnect and ":" not in backconnect:
+             user = os.getenv("WEBSHARE_PROXY_USER", "bqvqvpiu")
+             pw = os.getenv("WEBSHARE_PROXY_PASS", "5dkv4trtt7x7")
+             backconnect = f"http://{user}:{pw}@p.webshare.io:80"
+             log(f"PROXY: Detected token-only gateway. Reconstructed URL.")
+        elif "@" not in backconnect and os.getenv("WEBSHARE_PROXY_USER"):
             user = os.getenv("WEBSHARE_PROXY_USER")
             pw = os.getenv("WEBSHARE_PROXY_PASS")
             backconnect = f"http://{user}:{pw}@{backconnect.replace('http://', '')}"
@@ -252,7 +258,7 @@ async def discover_articles(keywords: List[str], day: date, geo: str, region_nam
         async with httpx.AsyncClient(
             timeout=30, 
             follow_redirects=True,
-            proxies={"http://": proxy_url, "https://": proxy_url} if proxy_url else None
+            proxy=proxy_url if proxy_url else None
         ) as client:
             async def fetch_rss(q, start_time, end_time):
                 if await is_job_cancelled(job_id):
