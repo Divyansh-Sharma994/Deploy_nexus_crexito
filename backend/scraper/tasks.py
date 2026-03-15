@@ -45,8 +45,8 @@ def run_scrape_task(self, job_id, sector, region, date_from, date_to, search_mod
     
     from scraper.engine import run_scrape_job
     
-    setup_event_loop()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     
     try:
         loop.run_until_complete(
@@ -64,6 +64,8 @@ def run_scrape_task(self, job_id, sector, region, date_from, date_to, search_mod
     except Exception as e:
         logger.error(f"Orchestrator failed for job {job_id}: {e}")
         raise e
+    finally:
+        loop.close()
 
 # ─── Scraper Node (I/O Intensive) ─────────────────────────────────────────────
 
@@ -75,8 +77,8 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id):
     """
     from scraper.engine import scrape_only
     
-    setup_event_loop()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
         
     try:
         article_id = loop.run_until_complete(
@@ -88,6 +90,8 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id):
             enrich_article_node.delay(article_id)
     except Exception as e:
         logger.error(f"Scrape node failed for {article_data.get('url')}: {e}")
+    finally:
+        loop.close()
 
 # ─── Enrichment Node (Compute Intensive) ──────────────────────────────────────
 
@@ -99,8 +103,8 @@ def enrich_article_node(self, article_id):
     """
     from scraper.llm import perform_full_enrichment
     
-    setup_event_loop()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
         
     async def run_enrichment():
         async with AsyncSessionLocal() as db:
@@ -134,3 +138,5 @@ def enrich_article_node(self, article_id):
     except Exception as e:
         # Retry logic for transient AI failures (e.g., rate limits)
         raise self.retry(exc=e, countdown=60)
+    finally:
+        loop.close()
