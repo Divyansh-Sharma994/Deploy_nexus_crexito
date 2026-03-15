@@ -209,6 +209,14 @@ async def update_phase_status(db, job_id, phase_name, status):
     except Exception as e:
         log(f"Error updating phase status: {e}")
 
+async def is_job_cancelled(job_id: str) -> bool:
+    """Check if the job has been flagged for cancellation in Redis."""
+    try:
+        r = await get_redis()
+        return await r.sismember("nexus:cancelled_jobs", job_id)
+    except:
+        return False
+
 # ─── Discovery Phase ──────────────────────────────────────────────────────────
 
 async def discover_articles(keywords: List[str], day: date, geo: str, region_name: str, job_id: str, cumulative: set = None) -> List[dict]:
@@ -244,9 +252,12 @@ async def discover_articles(keywords: List[str], day: date, geo: str, region_nam
         async with httpx.AsyncClient(
             timeout=30, 
             follow_redirects=True,
-            proxy=proxy_url if proxy_url else None
+            proxies={"http://": proxy_url, "https://": proxy_url} if proxy_url else None
         ) as client:
             async def fetch_rss(q, start_time, end_time):
+                if await is_job_cancelled(job_id):
+                    return
+
                 full_after = f"{day.isoformat()}T{start_time}"
                 full_before = f"{day.isoformat()}T{end_time}"
                 
@@ -303,6 +314,10 @@ async def discover_articles(keywords: List[str], day: date, geo: str, region_nam
             # Process window queries in small parallel batches
             batch_size = 5
             for i in range(0, len(window_queries), batch_size):
+                if await is_job_cancelled(job_id):
+                    log(f"Job {job_id} Cancelled. Stopping discovery.")
+                    return articles
+                    
                 batch = window_queries[i:i+batch_size]
                 await asyncio.gather(*[fetch_rss(q, start_t, end_t) for q in batch])
                 await asyncio.sleep(random.uniform(1, 4))
@@ -315,6 +330,11 @@ async def discover_articles(keywords: List[str], day: date, geo: str, region_nam
 
 async def scrape_only(article: dict, job_id: str, sector: str, region: str, user_id: str) -> Optional[int]:
     """Extraction Node: Playwright I/O ONLY."""
+    # C-X: Check for cancellation before starting expensive browser work
+    if await is_job_cancelled(job_id):
+        log(f"Scrape cancelled for job {job_id}. Skipping {article['url']}")
+        return None
+
     # C-X: Skip RSS feeds that sometimes leak into Google News entries
     if "/rss/" in article["url"] or "rss=1" in article["url"]:
         log(f"Skipping RSS feed URL: {article['url']}")

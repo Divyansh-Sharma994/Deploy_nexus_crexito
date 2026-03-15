@@ -123,6 +123,15 @@ async def delete_job(job_id: str, current_user: TokenData = Depends(get_current_
         job = res.scalar_one_or_none()
         if not job:
             raise HTTPException(404, "Job not found")
+        
+        # C-X: Signal cancellation to workers via Redis
+        from scraper.engine import get_redis
+        try:
+            r = await get_redis()
+            await r.sadd("nexus:cancelled_jobs", job_id)
+            await r.expire("nexus:cancelled_jobs", 86400) # 24h cleanup
+        except:
+            pass
             
         await db.execute(delete(Article).where(Article.scrape_job_id == job_id))
         await db.delete(job)
