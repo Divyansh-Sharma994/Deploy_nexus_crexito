@@ -4,9 +4,29 @@ from datetime import datetime
 from fastapi import APIRouter
 from sqlalchemy import select, func, text
 from db.database import get_db, ScrapeJob, Article
+from .auth_utils import get_auth_user as get_current_user, TokenData
+from celery_app import app as celery_app
 
 router = APIRouter()
 _diag_cache = {"data": None, "timestamp": None}
+
+@router.get("/browser")
+async def check_browser():
+    """Verify Playwright can launch."""
+    from scraper.engine import test_browser_launch
+    return await test_browser_launch()
+
+@router.get("/celery")
+async def check_celery():
+    """Check if any Celery workers are active."""
+    try:
+        i = celery_app.control.inspect()
+        active = i.active()
+        if active is None:
+            return {"status": "error", "message": "No response from workers (broker issue or no workers running)"}
+        return {"status": "online", "workers": list(active.keys())}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 @router.get("/health")
 async def get_system_health():
