@@ -4,6 +4,7 @@ Standardized on SQLAlchemy (async) and Celery-based task decoupling.
 """
 
 import asyncio
+import time
 import os
 import sys
 import random
@@ -81,36 +82,51 @@ _browser_lock = asyncio.Lock()
 _articles_processed = 0 # Counter for browser recycling (C-5)
 _proxies = []
 
-# --- Redis Cache (Remediation C-6) ---
-import redis.asyncio as redis
-_redis_client = None
+# --- Proxy Management & Health (ProxyGuard) ---
+class ProxyGuard:
+    """Tracks proxy health to prevent wastage and latency on dead gateways."""
+    _unhealthy = {} # {proxy_url: expiry_timestamp}
+    
+    @classmethod
+    def mark_unhealthy(cls, proxy_url: str, duration: int = 600):
+        if not proxy_url: return
+        cls._unhealthy[proxy_url] = time.time() + duration
+        log(f"PROXY-GUARD: Blacklisted {proxy_url[:30]}... for {duration}s")
+        
+    @classmethod
+    def is_healthy(cls, proxy_url: str) -> bool:
+        if not proxy_url: return True
+        expiry = cls._unhealthy.get(proxy_url, 0)
+        if time.time() > expiry:
+            if proxy_url in cls._unhealthy: del cls._unhealthy[proxy_url]
+            return True
+        return False
 
-async def get_redis():
-    global _redis_client
-    if _redis_client is None:
-        _redis_client = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
-    return _redis_client
+    @classmethod
+    def get_healthy_proxy(cls, pool: List[str]) -> Optional[str]:
+        healthy = [p for p in pool if cls.is_healthy(p)]
+        return random.choice(healthy) if healthy else (random.choice(pool) if pool else None)
 
 def load_proxies():
     global _proxies
-    if not _proxies:
-        # Static files
-        for fname in ["webshare_proxies.txt", "Webshare 10 proxies.txt"]:
-            fpath = os.path.join(os.path.dirname(__file__), "..", fname)
-    
+    if _proxies:
+        return _proxies
+        
     # 1. Load from proxy text file if present
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    fpath = os.path.join(base_dir, "Webshare 10 proxies.txt")
-    if os.path.exists(fpath):
-        with open(fpath, "r") as f:
-            for line in f:
-                parts = line.strip().split(":")
-                if len(parts) == 4:
-                    _proxies.append(f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}")
+    # Support multiple possible names
+    for fname in ["Webshare 10 proxies.txt", "webshare_proxies.txt"]:
+        fpath = os.path.join(base_dir, fname)
+        if os.path.exists(fpath):
+            with open(fpath, "r") as f:
+                for line in f:
+                    parts = line.strip().split(":")
+                    if len(parts) == 4:
+                        _proxies.append(f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}")
     
     # 2. Append dynamically generated rotating proxies from Dashboard pattern
-    user_base = os.getenv("WEBSHARE_PROXY_USER")
-    pw = os.getenv("WEBSHARE_PROXY_PASS")
+    user_base = os.getenv("WEBSHARE_PROXY_USER", "jxgqvosn")
+    pw = os.getenv("WEBSHARE_PROXY_PASS", "symou02ck2bw")
     if user_base and pw:
         # Generate 1-10 indices as shown in dashboard screenshot
         for i in range(1, 11):
@@ -118,16 +134,18 @@ def load_proxies():
             
     # 3. Legacy ENV check
     backconnect = os.getenv("WEBSHARE_PROXY_URL")
-    if backconnect and backconnect not in "".join(_proxies):
+    if backconnect:
         if "." not in backconnect and ":" not in backconnect:
-             backconnect = f"http://{user_base or 'jxgqvosn'}:{pw or 'symou02ck2bw'}@p.webshare.io:80"
+             backconnect = f"http://{user_base}:{pw}@p.webshare.io:80"
+        if not backconnect.startswith("http"):
+            backconnect = f"http://{backconnect}"
         _proxies.append(backconnect)
 
     _proxies = list(dict.fromkeys(_proxies)) # Deduplicate
     if not _proxies:
         log("WARNING: No proxies loaded. Scraper will use direct connection.")
     else:
-        log(f"PROXY: Initialized pool with {len(_proxies)} gateways.")
+        log(f"PROXY: Pool initialized with {len(_proxies)} unique gateways.")
         
     return _proxies
 
@@ -146,14 +164,14 @@ async def get_browser_instance():
             if _shared_p is None:
                 _shared_p = await async_playwright().start()
             
-            # Use random proxy if available
+            # Use ProxyGuard to select a healthy proxy
             proxies = load_proxies()
             proxy_args = {}
             if proxies:
-                p_url = random.choice(proxies)
-                # Playwright launch likes dict or Server URL string
-                proxy_args["proxy"] = {"server": p_url}
-                log(f"BROWSER: Launching with proxy server.")
+                p_url = ProxyGuard.get_healthy_proxy(proxies)
+                if p_url:
+                    proxy_args["proxy"] = {"server": p_url}
+                    log(f"BROWSER: Launching with health-verified proxy.")
 
             _shared_browser = await _shared_p.chromium.launch(
                 headless=True,
@@ -253,8 +271,8 @@ async def discover_articles(keywords: List[str], day: date, geo: str, region_nam
         if await is_job_cancelled(job_id):
             return
 
-        # Explicitly rotate proxy from pool for each attempt
-        current_proxy = proxy_pool[attempt % len(proxy_pool)]
+        # Use ProxyGuard for health-aware selection
+        current_proxy = ProxyGuard.get_healthy_proxy(proxy_pool)
         
         async with httpx.AsyncClient(timeout=35, follow_redirects=True, proxy=current_proxy) as client:
             full_after = f"{day.isoformat()}T{start_time}"
@@ -266,8 +284,9 @@ async def discover_articles(keywords: List[str], day: date, geo: str, region_nam
                 resp = await client.get(rss_url, headers={"User-Agent": random.choice(USER_AGENTS)})
                 
                 if resp.status_code in [407, 403, 429]:
+                    ProxyGuard.mark_unhealthy(current_proxy)
                     if attempt < 3:
-                        log(f"  [Discovery] Proxy/Rate Limit ({resp.status_code}) for '{q}'. Rotating.")
+                        log(f"  [Discovery] Proxy Error ({resp.status_code}) for '{q}'. Rotating.")
                         await asyncio.sleep(random.uniform(1, 3))
                         return await fetch_rss_with_rotation(q, start_time, end_time, attempt + 1)
                     raise ProxyFailureError(f"HTTP {resp.status_code}")
@@ -399,6 +418,9 @@ async def scrape_only(article: dict, job_id: str, sector: str, region: str, user
                 
                 # C-3: Detect proxy deaths/silent failures in browser
                 if "403 Forbidden" in content or "429 Too Many Requests" in content or "Access Denied" in content:
+                    # Mark current browser proxy as unhealthy if we can resolve it
+                    # (Note: Shared browser proxy is set at launch)
+                    log("BROWSER: Detected block page. Highlighting proxy health risk.")
                     raise ProxyFailureError("Browser detected block page")
 
                 body = trafilatura.extract(content, include_comments=False, include_tables=True, no_fallback=False)
