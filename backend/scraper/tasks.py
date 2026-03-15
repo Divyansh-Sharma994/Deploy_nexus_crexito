@@ -74,19 +74,23 @@ def run_scrape_task(self, job_id, sector, region, date_from, date_to, search_mod
         loop.close()
 
 # ─── Scraper Node (I/O Intensive) ─────────────────────────────────────────────
-
-@celery_app.task(name="scraper.tasks.scrape_article_node", bind=True, rate_limit="30/m")
+@celery_app.task(name="scraper.tasks.scrape_article_node", bind=True, rate_limit="30/m", max_retries=3, default_retry_delay=10)
 def scrape_article_node(self, article_data, job_id, sector, region, user_id):
     """
     Task Node 1: Fetches HTML and extracts raw body. 
-    NO AI calls here.
+    Now with retries for transient event loop or network errors.
     """
-    from scraper.engine import scrape_only
+    from scraper.engine import scrape_only, is_job_cancelled
     
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
         
     try:
+        # C-X: Pre-emptive cancellation check
+        if loop.run_until_complete(is_job_cancelled(job_id)):
+            logger.info(f"Scrape task pre-emptively halted for job {job_id} [Reason: Job Cancelled/Global Stop]")
+            return None
+
         article_id = loop.run_until_complete(
             scrape_only(article_data, job_id, sector, region, user_id)
         )
@@ -96,6 +100,8 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id):
             enrich_article_node.delay(article_id)
     except Exception as e:
         logger.error(f"Scrape node failed for {article_data.get('url')}: {e}")
+        # Retry for transient errors (like event loop closure or shared browser timeouts)
+        raise self.retry(exc=e)
     finally:
         try:
             pending = asyncio.all_tasks(loop)

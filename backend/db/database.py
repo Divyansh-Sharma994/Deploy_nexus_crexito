@@ -17,16 +17,29 @@ def get_database_url():
         url = url.replace("postgresql://", "postgresql+asyncpg://")
     return url
 
-engine = create_async_engine(
-    get_database_url(),
-    echo=False,
-    pool_size=int(os.getenv("DB_POOL_SIZE", "100")),
-    max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "50")),
-    pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "60")),
-    pool_recycle=3600,
-    pool_pre_ping=True, # Critical for detecting stale connections
-    connect_args={"timeout": 60} if "sqlite" in get_database_url() else {"command_timeout": 60}
-)
+from sqlalchemy.pool import NullPool, QueuePool
+
+# Selective Pooling: Use NullPool for workers to prevent gevent/asyncpg lifecycle conflicts.
+# The user's log analysis highlighted that asyncpg termination fails when many workers share a pool.
+use_nullpool = os.getenv("DB_USE_NULLPOOL", "false").lower() == "true"
+
+engine_args = {
+    "echo": False,
+    "pool_pre_ping": True,
+    "connect_args": {"timeout": 60} if "sqlite" in get_database_url() else {"command_timeout": 60}
+}
+
+if use_nullpool:
+    engine_args["poolclass"] = NullPool
+else:
+    engine_args.update({
+        "pool_size": int(os.getenv("DB_POOL_SIZE", "20")),
+        "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "10")),
+        "pool_timeout": int(os.getenv("DB_POOL_TIMEOUT", "60")),
+        "pool_recycle": 3600,
+    })
+
+engine = create_async_engine(get_database_url(), **engine_args)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 # ─── Models ──────────────────────────────────────────────────────────────────

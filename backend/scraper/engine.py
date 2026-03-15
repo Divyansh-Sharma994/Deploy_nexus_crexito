@@ -241,11 +241,30 @@ async def is_job_cancelled(job_id: str) -> bool:
         r = await get_redis()
         # 1. Check Global Kill Switch
         if await r.get("nexus:global_stop"):
+            log(f"CANCELLATION: Global Stop Flag detected in Redis. Halting all tasks.")
             return True
         # 2. Check Specific Job
-        return await r.sismember("nexus:cancelled_jobs", job_id)
+        if await r.sismember("nexus:cancelled_jobs", job_id):
+            log(f"CANCELLATION: Job {job_id} has been explicitly cancelled by user/system.")
+            return True
+        return False
     except:
         return False
+
+# --- Relevance Logic ---
+def verify_brand_relevance(text: str, keywords: List[str]) -> bool:
+    """Strict verification: ensure at least one keyword appears in content."""
+    if not text or not keywords:
+        return True # Default to inclusive if no filter provided
+    
+    text_lower = text.lower()
+    for kw in keywords:
+        if kw.lower() in text_lower:
+            return True
+            
+    # Fuzzy check: If it's a multi-word brand, check if at least 50% of words match
+    # (Optional, but helps with Google News fuzziness)
+    return False
 
 # ─── Discovery Phase ──────────────────────────────────────────────────────────
 
@@ -363,17 +382,42 @@ async def scrape_only(article: dict, job_id: str, sector: str, region: str, user
         log(f"Scrape cancelled for job {job_id}. Skipping {article['url']}")
         return None
 
-    # C-X: Skip RSS feeds that sometimes leak into Google News entries
-    if "/rss/" in article["url"] or "rss=1" in article["url"]:
-        log(f"Skipping RSS feed URL: {article['url']}")
-        # Increment progress even for skipped RSS
-        async with get_db() as db:
-            await db.execute(update(ScrapeJob).where(ScrapeJob.id == job_id).values(total_scraped=ScrapeJob.total_scraped + 1))
-            await db.commit()
-        return None
-
     try:
         url = article["url"]
+        
+        # 0. Resolve Google News Redirects BEFORE skipping RSS patterns
+        # Google News URLs often contain "/rss/" which triggers the skip logic prematurely.
+        if "news.google.com/rss/articles" in url:
+            res = await resolve_google_news_url(url)
+            if res: 
+                url = res
+                article["url"] = url # Update for downstream use
+                log(f"Resolved Google News URL to: {url[:60]}...")
+
+        # 1. Skip genuine RSS feeds/snippets
+        # We check the RESOLVED URL now, which is much safer.
+        if "/rss/" in url or "rss=1" in url or "feed" in url.lower():
+            # Special case: if it resolved to a news article but still has 'rss' in it, 
+            # we might want to be careful, but usually real articles don't have /rss/ in path.
+            if "news.google.com" not in url: # If it's still google news, it's definitely a redirect/feed
+                log(f"Skipping genuine RSS/Feed URL: {url}")
+                try:
+                    async with get_db() as db:
+                        await db.execute(update(ScrapeJob).where(ScrapeJob.id == job_id).values(total_scraped=ScrapeJob.total_scraped + 1))
+                        await db.commit()
+                except: pass
+                return None
+
+        # Determine keywords for relevance filtering
+        keywords = []
+        if "brand_name" in article and article["brand_name"]:
+            keywords = [article["brand_name"]]
+        
+        # Try to extract keywords from sector if it's a known sector
+        from scraper.config import SECTOR_KEYWORDS
+        if sector.lower() in SECTOR_KEYWORDS:
+            keywords.extend(SECTOR_KEYWORDS[sector.lower()])
+
         # Default date from discovery
         pub_at_str = article.get("published_at")
         try:
@@ -384,10 +428,6 @@ async def scrape_only(article: dict, job_id: str, sector: str, region: str, user
                 final_pub_at = datetime.now() # Fallback
         except:
             final_pub_at = datetime.now()
-
-        if "news.google.com/rss/articles" in url:
-            res = await resolve_google_news_url(url)
-            if res: url = res
 
         sem = get_browser_semaphore()
         async with sem:
@@ -414,17 +454,21 @@ async def scrape_only(article: dict, job_id: str, sector: str, region: str, user
                     log(f"  [Scraper] Timeout/Error loading {article['url']}: {e}")
                     return None
 
+                # C-X: Cancel Check 2
+                if await is_job_cancelled(job_id): return None
+
                 # Phase 2: Stealth waiting & Scroll
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await page.wait_for_timeout(random.randint(2000, 4000))
                 
+                # C-X: Cancel Check 3
+                if await is_job_cancelled(job_id): return None
+
                 # Phase 3: Extraction
                 content = await page.content()
                 
                 # C-3: Detect proxy deaths/silent failures in browser
                 if "403 Forbidden" in content or "429 Too Many Requests" in content or "Access Denied" in content:
-                    # Mark current browser proxy as unhealthy if we can resolve it
-                    # (Note: Shared browser proxy is set at launch)
                     log("BROWSER: Detected block page. Highlighting proxy health risk.")
                     raise ProxyFailureError("Browser detected block page")
 
@@ -449,6 +493,10 @@ async def scrape_only(article: dict, job_id: str, sector: str, region: str, user
                 extracted_date = extract_date(content)
                 if extracted_date:
                     final_pub_at = extracted_date
+                else:
+                    # FIX: If date extraction failed, don't default to 'now' for the 24h check.
+                    # Use the discovery date if available, or stay with the original 'final_pub_at'
+                    pass
 
             except Exception as outer_e:
                 log(f"  [Scraper] Extraction Error for {article['url']}: {outer_e}")
@@ -457,87 +505,102 @@ async def scrape_only(article: dict, job_id: str, sector: str, region: str, user
                 if context: await context.close()
 
         # --- Filtering & Relevance Logic ---
-        # --- Filtering & Resource Management ---
-        # User requested max discovery (2k+), so we relax filtering significantly.
-        # We only reject if body is completely empty.
         
-        # 1. Strict 24h Date Check (Keep this to ensure freshness unless user says otherwise)
+        # 1. Strict Brand Matching (C-X)
+        if keywords and not verify_brand_relevance(f"{article['title']} {body}", keywords):
+            log(f"Filtering article (Irrelevant to {keywords}): {article['title']}")
+            # Proceed to delete placeholder and increment progress
+            body = None # Mark as rejected
+        
+        # 2. Strict 24h Date Check
         now = datetime.now()
         if final_pub_at.tzinfo: now = now.astimezone(final_pub_at.tzinfo)
         date_invalid = (now - final_pub_at) > timedelta(hours=24)
 
         if not body or date_invalid:
-            async with get_db() as db:
-                await db.execute(delete(Article).where(Article.url == article["url"]))
-                log(f"Removed placeholder (EmptyBody:{not body}, DateInvalid:{date_invalid}): {article['title']}")
+            try:
+                async with get_db() as db:
+                    await db.execute(delete(Article).where(Article.url == article["url"]))
+                    log(f"Removed placeholder (EmptyBody:{not body}, DateInvalid:{date_invalid}): {article['title']}")
+                    
+                    # Increment progress even for rejected articles
+                    await db.execute(update(ScrapeJob).where(ScrapeJob.id == job_id).values(total_scraped=ScrapeJob.total_scraped + 1))
+                    
+                    # Check for completion
+                    job_res = await db.execute(select(ScrapeJob).where(ScrapeJob.id == job_id))
+                    job = job_res.scalar_one_or_none()
+                    if job and job.total_scraped >= job.total_found:
+                        await db.execute(update(ScrapeJob).where(ScrapeJob.id == job_id).values(status='completed', completed_at=datetime.now()))
+                    
+                    await db.commit()
+            except Exception as loop_e:
+                # Capture and log, but don't crash the task
+                if "Event loop is closed" in str(loop_e):
+                    log("Cleanup DB call skipped: Event loop already closed.")
+                else:
+                    log(f"Cleanup DB error: {loop_e}")
+            return None
+
+        async with get_db() as db:
+            try:
+                dialect = db.get_bind().dialect.name
+                val_dict = {
+                    "title": article["title"], "url": article["url"], "full_body": body,
+                    "author": author, "agency": article.get("agency"),
+                    "published_at": final_pub_at,
+                    "sector": sector,
+                    "region": region, "scrape_job_id": job_id, "user_id": user_id
+                }
+
+                if dialect == 'postgresql':
+                    from sqlalchemy.dialects.postgresql import insert as pg_upsert
+                    stmt = pg_upsert(Article).values(**val_dict)
+                    stmt = stmt.on_conflict_do_update(
+                        index_elements=['url'],
+                        set_={"full_body": stmt.excluded.full_body, "scrape_job_id": stmt.excluded.scrape_job_id, "author": stmt.excluded.author, "published_at": stmt.excluded.published_at}
+                    ).returning(Article.id)
+                else:
+                    from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
+                    stmt = sqlite_upsert(Article).values(**val_dict)
+                    stmt = stmt.on_conflict_do_update(
+                        index_elements=['url'],
+                        set_={"full_body": text("excluded.full_body"), "scrape_job_id": text("excluded.scrape_job_id"), "author": text("excluded.author"), "published_at": text("excluded.published_at")}
+                    ).returning(Article.id)
                 
-                # Increment progress even for rejected articles
-                await db.execute(update(ScrapeJob).where(ScrapeJob.id == job_id).values(total_scraped=ScrapeJob.total_scraped + 1))
+                # C-6: Pre-screen URL with Redis to avoid UPSERT overhead
+                from scraper.llm import get_redis
+                r = await get_redis()
+                SEEN_KEY = "nexus:seen_urls"
+                res = None
+                if await r.sismember(SEEN_KEY, article["url"]):
+                    log(f"Redis Cache Hit: Skipping UPSERT for {article['url'][:50]}")
+                else:
+                    res = await db.execute(stmt)
+                    await r.sadd(SEEN_KEY, article["url"])
+                    await r.expire(SEEN_KEY, 86400) # 24h TTL
                 
-                # Check for completion
+                # Real-time Progress Tracking
+                await db.execute(
+                    update(ScrapeJob)
+                    .where(ScrapeJob.id == job_id)
+                    .values(total_scraped=ScrapeJob.total_scraped + 1)
+                )
+                
+                # Final completion check
                 job_res = await db.execute(select(ScrapeJob).where(ScrapeJob.id == job_id))
                 job = job_res.scalar_one_or_none()
                 if job and job.total_scraped >= job.total_found:
                     await db.execute(update(ScrapeJob).where(ScrapeJob.id == job_id).values(status='completed', completed_at=datetime.now()))
-                
+                    log(f"Job {job_id} Fully Completed.")
+
                 await db.commit()
-            return None
-
-        async with get_db() as db:
-            dialect = db.get_bind().dialect.name
-            val_dict = {
-                "title": article["title"], "url": article["url"], "full_body": body,
-                "author": author, "agency": article.get("agency"),
-                "published_at": final_pub_at,
-                "sector": brand_to_check if brand_to_check else sector,
-                "region": region, "scrape_job_id": job_id, "user_id": user_id
-            }
-
-            if dialect == 'postgresql':
-                from sqlalchemy.dialects.postgresql import insert as pg_upsert
-                stmt = pg_upsert(Article).values(**val_dict)
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=['url'],
-                    set_={"full_body": stmt.excluded.full_body, "scrape_job_id": stmt.excluded.scrape_job_id, "author": stmt.excluded.author, "published_at": stmt.excluded.published_at}
-                ).returning(Article.id)
-            else:
-                from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
-                stmt = sqlite_upsert(Article).values(**val_dict)
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=['url'],
-                    set_={"full_body": text("excluded.full_body"), "scrape_job_id": text("excluded.scrape_job_id"), "author": text("excluded.author"), "published_at": text("excluded.published_at")}
-                ).returning(Article.id)
-            
-            # C-6: Pre-screen URL with Redis to avoid UPSERT overhead
-            from scraper.llm import get_redis
-            r = await get_redis()
-            SEEN_KEY = "nexus:seen_urls"
-            res = None
-            if await r.sismember(SEEN_KEY, article["url"]):
-                log(f"Redis Cache Hit: Skipping UPSERT for {article['url'][:50]}")
-                # Still need to increment scraped count if we consider it "done" or just skip
-                # Let's say we just skip for performance
-            else:
-                res = await db.execute(stmt)
-                await r.sadd(SEEN_KEY, article["url"])
-                await r.expire(SEEN_KEY, 86400) # 24h TTL
-            
-            # Real-time Progress Tracking
-            await db.execute(
-                update(ScrapeJob)
-                .where(ScrapeJob.id == job_id)
-                .values(total_scraped=ScrapeJob.total_scraped + 1)
-            )
-            
-            # Final completion check
-            job_res = await db.execute(select(ScrapeJob).where(ScrapeJob.id == job_id))
-            job = job_res.scalar_one_or_none()
-            if job and job.total_scraped >= job.total_found:
-                await db.execute(update(ScrapeJob).where(ScrapeJob.id == job_id).values(status='completed', completed_at=datetime.now()))
-                log(f"Job {job_id} Fully Completed.")
-
-            await db.commit()
-            return res.scalar() if res else None
+                return res.scalar() if res else None
+            except Exception as db_e:
+                if "Event loop is closed" in str(db_e):
+                    log("Final DB save skipped: Event loop already closed.")
+                else:
+                    log(f"Final DB save error: {db_e}")
+                return None
     except Exception as e:
         log(f"Scrape failed for {article['url'][:30]}: {e}")
         return None

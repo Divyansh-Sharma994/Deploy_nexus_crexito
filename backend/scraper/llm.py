@@ -38,7 +38,11 @@ def log(msg: str):
 async def summarize_with_groq(text: str) -> Optional[str]:
     """Groq LPU summarization with retry on rate-limit."""
     is_placeholder = any("your_groq_api_key" in k.lower() for k in GROQ_API_KEYS)
-    if not GROQ_API_KEYS or is_placeholder or not text or len(text) < 400:
+    if not GROQ_API_KEYS or is_placeholder:
+        log("Groq Summary Skip: No valid API keys found.")
+        return None
+    if not text or len(text) < 400:
+        log(f"Groq Summary Skip: Text too short ({len(text) if text else 0} chars).")
         return None
     
     url = "https://api.groq.com/openai/v1/chat/completions"

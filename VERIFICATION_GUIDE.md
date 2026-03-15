@@ -4,7 +4,7 @@ This guide provides three distinct levels of verification to certify that your b
 
 ---
 
-## 🟢 Level 1: System Heartbeat (Instant)
+## 🟢 1. System Heartbeat (Instant)
 The fastest way to check if the core services (Database & Redis) are alive.
 
 **How to check:**
