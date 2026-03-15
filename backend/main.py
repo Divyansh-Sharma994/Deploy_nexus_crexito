@@ -165,46 +165,54 @@ def root():
 
 @app.get("/health")
 async def health():
-    """Enterprise Health Check (D-3)."""
+    """Lightweight Health Check (D-3)."""
+    health_status = {
+        "status": "unhealthy",
+        "timestamp": datetime.now().isoformat(),
+        "services": {}
+    }
+    
     try:
-        from scraper.engine import get_browser_instance, get_redis
+        from scraper.engine import get_redis
         
-        # 1. Check DB
-        db_start = time.time()
-        async with get_db() as db:
-            res = await db.execute(select(func.count(Article.id)))
-            count = res.scalar()
-        db_ms = int((time.time() - db_start) * 1000)
+        # 1. Check DB (minimal)
+        try:
+            async with get_db() as db:
+                await db.execute(select(1))
+            health_status["services"]["database"] = "connected"
+        except Exception as e:
+            health_status["services"]["database"] = f"error: {str(e)}"
+            
+        # 2. Check Redis (minimal)
+        try:
+            r = await get_redis()
+            await r.ping()
+            health_status["services"]["redis"] = "connected"
+        except Exception as e:
+            health_status["services"]["redis"] = f"error: {str(e)}"
 
-        # 2. Check Redis
-        redis_start = time.time()
-        r = await get_redis()
-        await r.ping()
-        redis_ms = int((time.time() - redis_start) * 1000)
+        # Final Status
+        if all(s == "connected" for s in health_status["services"].values()):
+            health_status["status"] = "healthy"
+            return health_status
+        else:
+            return JSONResponse(status_code=503, content=health_status)
 
-        # 3. Warm-up Browser
-        browser_start = time.time()
+    except Exception as e:
+        health_status["error"] = str(e)
+        return JSONResponse(status_code=503, content=health_status)
+
+@app.get("/health/browser")
+async def health_browser():
+    """Heavy Browser Warm-up Check."""
+    try:
+        from scraper.engine import get_browser_instance
+        start = time.time()
         browser = await get_browser_instance()
-        browser_ok = browser is not None and browser.is_connected()
-        browser_ms = int((time.time() - browser_start) * 1000)
-
+        ok = browser is not None and browser.is_connected()
         return {
-            "status": "healthy" if browser_ok else "degraded",
-            "uptime": "TODO", # Add uptime logic if needed
-            "total_articles": count,
-            "latency_ms": {
-                "database": db_ms,
-                "redis": redis_ms,
-                "browser": browser_ms
-            },
-            "services": {
-                "redis": "connected",
-                "browser": "ready" if browser_ok else "failed"
-            }
+            "status": "ready" if ok else "failed",
+            "latency_ms": int((time.time() - start) * 1000)
         }
     except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return JSONResponse(
-            status_code=503,
-            content={"status": "unhealthy", "error": str(e)}
-        )
+        return JSONResponse(status_code=503, content={"status": "failed", "error": str(e)})
