@@ -17,7 +17,7 @@ export default function Dashboard({ onNavigate }) {
     return () => clearInterval(interval);
   }, []);
 
-  const activeJobs = jobs.filter(j => j.status === 'running' || j.status === 'pending');
+  const activeJobs = Array.isArray(jobs) ? jobs.filter(j => j.status === 'running' || j.status === 'pending') : [];
   const maxSector = stats?.by_sector?.[0]?.count || 1;
   const maxRegion = stats?.by_region?.[0]?.count || 1;
 

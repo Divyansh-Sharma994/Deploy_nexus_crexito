@@ -79,7 +79,8 @@ function ProtectedApp() {
       if (!token) return;
       
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const target = window.location.host.includes('localhost') ? 'localhost:8000' : window.location.host;
+      // WebSocket MUST connect directly to Railway (Vercel proxy doesn't support WS)
+      const target = 'morningtracker-production.up.railway.app';
       ws = new WebSocket(`${protocol}//${target}/api/articles/ws/stats?token=${token}`);
       ws.onmessage = (msg) => {
         setApiStatus("online");
@@ -101,6 +102,8 @@ function ProtectedApp() {
 
   if (!user) return <Navigate to="/login" />;
 
+  // Defensive array check for production robustness
+  const activeJobs = Array.isArray(jobs) ? jobs.filter(j => j.status === 'running' || j.status === 'pending') : [];
   const statusColor = apiStatus === "online" ? "var(--success)" : "var(--danger)";
 
   return (

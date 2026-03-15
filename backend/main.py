@@ -63,7 +63,7 @@ async def global_exception_handler(request: Request, call_next):
 # CORS
 _raw_origins = os.getenv(
     "CORS_ORIGINS",
-    "http://localhost:5173,http://localhost:5174,http://localhost:5175,http://localhost:3000"
+    "http://localhost:5173,http://localhost:5174,http://localhost:5175,http://localhost:3000,https://morning-tracker-sigma.vercel.app"
 )
 ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 
