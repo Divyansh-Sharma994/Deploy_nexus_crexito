@@ -141,15 +141,18 @@ def discover_articles(keywords: List[str], day: date, geo: str, region_name: str
         if is_job_cancelled(job_id): return
         current_proxy = ProxyGuard.get_healthy_proxy(proxy_pool)
         
-        # Use native 'when:1d' for the last 24 hours if searching for today
+        # Use official tbs parameters for time filtering (C-X)
         is_today = day >= date.today()
-        query = f"{q} when:1d" if is_today else q
+        if is_today:
+            tbs = "qdr:d,sbd:1"
+        else:
+            # Format: cdr:1,cd_min:MM/DD/YYYY,cd_max:MM/DD/YYYY,sbd:1
+            date_str = day.strftime("%m/%d/%Y")
+            tbs = f"cdr:1,cd_min:{date_str},cd_max:{date_str},sbd:1"
         
         with httpx.Client(timeout=35, follow_redirects=True, proxy=current_proxy) as client:
             domain = REGION_MAP.get(geo, "google.com")
-            # If historical, we use the start/end params, though native 'when' is preferred for current day
-            suffix = f"&start={day.isoformat()}T{start_time}&end={day.isoformat()}T{end_time}" if not is_today else ""
-            rss_url = f"https://news.{domain}/rss/search?q={quote_plus(query)}&hl={hl}&gl=IN&ceid={ceid}{suffix}"
+            rss_url = f"https://news.{domain}/rss/search?q={quote_plus(q)}&hl={hl}&gl=IN&ceid={ceid}&tbs={quote_plus(tbs)}"
             try:
                 resp = client.get(rss_url, headers={"User-Agent": random_ua()})
                 if resp.status_code in [407, 403, 429]:
