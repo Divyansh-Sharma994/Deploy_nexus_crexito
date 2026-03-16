@@ -1,8 +1,7 @@
-import asyncio
 import threading
 import logging
-from playwright.async_api import async_playwright
 import random
+from playwright.sync_api import sync_playwright
 
 logger = logging.getLogger(__name__)
 
@@ -14,40 +13,38 @@ USER_AGENTS = [
 
 def scrape_url(url: str, timeout: int = 45000) -> str | None:
     """
-    Runs Playwright in a brand new thread with its own event loop.
-    Safe to call from gevent workers.
+    Runs Synchronous Playwright in a brand new thread.
+    This avoids event loop conflicts with gevent/asyncio.
     """
     result = {"content": None, "error": None}
 
     def _run_in_thread():
-        async def _async_scrape():
-            async with async_playwright() as p:
-                # Use a random UA for stealth
+        try:
+            with sync_playwright() as p:
                 ua = random.choice(USER_AGENTS)
-                browser = await p.chromium.launch(
+                browser = p.chromium.launch(
                     headless=True,
                     args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-software-rasterizer"]
                 )
                 try:
-                    context = await browser.new_context(user_agent=ua)
-                    page = await context.new_page()
+                    context = browser.new_context(user_agent=ua)
+                    page = context.new_page()
                     
-                    # BLOCK RESOURCES FOR SPEED
-                    async def block_aggressively(route):
+                    # BLOCK RESOURCES FOR SPEED (Sync API)
+                    def block_aggressively(route):
                         if route.request.resource_type in ["image", "media", "font", "stylesheet", "other"]:
-                            await route.abort()
+                            route.abort()
                         else:
-                            await route.continue_()
+                            route.continue_()
                     
-                    await page.route("**/*", block_aggressively)
+                    page.route("**/*", block_aggressively)
                     
-                    # Set extra headers
-                    await page.set_extra_http_headers({
+                    page.set_extra_http_headers({
                         "Accept-Language": "en-US,en;q=0.9",
                     })
 
-                    logger.info(f"Threaded scraper: Navigating to {url}")
-                    response = await page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+                    logger.info(f"Threaded sync scraper: Navigating to {url}")
+                    response = page.goto(url, timeout=timeout, wait_until="domcontentloaded")
                     
                     if not response:
                         result["error"] = "No response"
@@ -58,30 +55,21 @@ def scrape_url(url: str, timeout: int = 45000) -> str | None:
                         return
 
                     # Wait a bit for dynamic content
-                    await asyncio.sleep(1)
-                    result["content"] = await page.content()
+                    page.wait_for_timeout(1000)
+                    result["content"] = page.content()
                     
                 except Exception as e:
                     result["error"] = str(e)
                 finally:
-                    await browser.close()
-
-        # Create a fresh event loop for this thread
-        new_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(new_loop)
-        try:
-            new_loop.run_until_complete(_async_scrape())
+                    browser.close()
         except Exception as e:
-            result["error"] = f"Loop error: {str(e)}"
-        finally:
-            new_loop.close()
+            result["error"] = f"Launch error: {str(e)}"
 
     thread = threading.Thread(target=_run_in_thread, daemon=True)
     thread.start()
     
     # Wait for the thread to finish
-    # Playwright timeout is usually sufficient, but we add a safety buffer
-    thread.join(timeout=(timeout / 1000) + 10)
+    thread.join(timeout=(timeout / 1000) + 15)
 
     if thread.is_alive():
         logger.error(f"Scraper thread timed out for {url}")
