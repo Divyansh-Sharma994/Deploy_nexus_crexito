@@ -176,9 +176,14 @@ def discover_articles(keywords: List[str], day: date, geo: str, region_name: str
                             if hasattr(entry, 'published_parsed'):
                                 parsed_date = datetime.fromtimestamp(time.mktime(entry.published_parsed)).date()
                             
-                            # If we have a date, strictly enforce it for historical scans.
-                            # For 'today' (qdr:d), we allow it since rolling 24h is fine.
-                            if not is_today and parsed_date and parsed_date != day:
+                            # Strict Date Filtering
+                            # For Today (qdr:d), we allow articles from today or yesterday (48h window)
+                            # to account for timezones and Google's rolling 24h logic.
+                            # For historical scans (cdr), we strictly enforce the specific day.
+                            if is_today:
+                                if parsed_date and (day - parsed_date).days > 1:
+                                    continue
+                            elif parsed_date and parsed_date != day:
                                 continue
                                 
                             pub_date_str = day.isoformat()
