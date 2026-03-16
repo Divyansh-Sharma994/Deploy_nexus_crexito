@@ -1,39 +1,29 @@
 """
 Distributed CLI Runner for News Intelligence Scraper.
-Supports:
-  1. Discovery Phase: Finds URLs and seeds the Database.
-  2. Scrape Phase: Picks a chunk of pending articles and extracts content + summary.
+Synchronous version for gevent/distributed systems.
 """
 
 import sys
-import asyncio
 import argparse
 from datetime import datetime, date
 from scraper.engine import run_scrape_job, discover_articles, SECTOR_KEYWORDS, SEARCH_MODIFIERS, REGION_MAP, scrape_only
 from sqlalchemy import text
-from db.database import get_db, init_db
-import httpx
-from playwright.async_api import async_playwright
+from db.database import get_db_sync, init_db_sync, Article, ScrapeJob
 
-async def run_discovery(sector: str, region: str, day_str: str):
-    await init_db()
+def run_discovery(sector: str, region: str, day_str: str):
+    init_db_sync()
     day = date.fromisoformat(day_str)
     
     keywords = SECTOR_KEYWORDS.get(sector.lower(), [sector])
-    queries = []
-    for kw in keywords:
-        for mod in SEARCH_MODIFIERS: queries.append(f'"{kw}" {mod} {region}')
-        for city in REGION_MAP.get(region.lower(), {}).get("cities", []): queries.append(f'"{kw}" {city}')
-
-    geo = REGION_MAP.get(region.lower(), {"geo": "US"})["geo"]
+    geo = REGION_MAP.get(region.lower(), {"geo": "IN"})["geo"]
     job_id = f"dist-{int(datetime.now().timestamp())}"
     cumulative = set()
-    discovered = await discover_articles(queries, day, geo, job_id, [sector], cumulative)
     
+    discovered = discover_articles(keywords, day, geo, region, job_id, cumulative)
     print(f"DISCOVERY_COUNT={len(discovered)}")
     
-    async with get_db() as db:
-        await db.execute(text("""
+    with get_db_sync() as db:
+        db.execute(text("""
             INSERT INTO scrape_jobs (id, sector, region, date_from, date_to, status, total_found, started_at) 
             VALUES (:id, :sector, :region, :date_from, :date_to, :status, :total, :started)
         """), {
@@ -44,29 +34,25 @@ async def run_discovery(sector: str, region: str, day_str: str):
         })
         
         for article in discovered:
-            # We use the same upsert-compatible logic as engine.py for safety
             val_dict = {
-                "title": article["title"], "url": article["url"], "agency": article["agency"],
-                "published_at": article["published_at"], "sector": sector, "region": region, 
-                "scrape_job_id": job_id, "title_hash": article.get("title_hash")
+                "title": article["title"], "url": article["url"], "agency": article.get("agency"),
+                "published_at": datetime.fromisoformat(article["published_at"]) if isinstance(article["published_at"], str) else article["published_at"],
+                "sector": sector, "region": region, 
+                "scrape_job_id": job_id
             }
-            
-            # Using simple text() with ON CONFLICT for SQLite specifically here since this is often used for local debugging
-            await db.execute(text("""
-                INSERT INTO articles (title, url, agency, published_at, sector, region, scrape_job_id, title_hash)
-                VALUES (:title, :url, :agency, :published_at, :sector, :region, :scrape_job_id, :title_hash)
+            db.execute(text("""
+                INSERT INTO articles (title, url, agency, published_at, sector, region, scrape_job_id)
+                VALUES (:title, :url, :agency, :published_at, :sector, :region, :scrape_job_id)
                 ON CONFLICT (url) DO NOTHING
             """), val_dict)
             
-        await db.commit()
-    
+        db.commit()
     print(f"JOB_ID={job_id}")
 
-async def run_worker(job_id: str, chunk_index: int, total_chunks: int):
-    await init_db()
-    async with get_db() as db:
-        # Fetch a slice of articles for this job that haven't been scraped yet
-        res = await db.execute(text("SELECT * FROM articles WHERE scrape_job_id=:job_id AND full_body IS NULL"), {"job_id": job_id})
+def run_worker(job_id: str, chunk_index: int, total_chunks: int):
+    init_db_sync()
+    with get_db_sync() as db:
+        res = db.execute(text("SELECT * FROM articles WHERE scrape_job_id=:job_id AND full_body IS NULL"), {"job_id": job_id})
         all_pending = res.mappings().all()
         
         if not all_pending:
@@ -83,10 +69,8 @@ async def run_worker(job_id: str, chunk_index: int, total_chunks: int):
         for art in my_chunk:
             print(f"Scraping: {art['title']}")
             try:
-                # Convert mapping to dict
                 art_dict = dict(art)
-                # scrape_only handles its own browser
-                await scrape_only(art_dict, job_id, art_dict["sector"], art_dict["region"])
+                scrape_only(art_dict, job_id, art_dict["sector"], art_dict["region"], "admin")
             except Exception as e:
                 print(f"Error scraping {art['title']}: {e}")
 
@@ -104,12 +88,12 @@ if __name__ == "__main__":
     
     try:
         if args.mode == "discovery":
-            asyncio.run(run_discovery(args.sector, args.region, args.date))
+            run_discovery(args.sector, args.region, args.date)
         elif args.mode == "worker":
             if not args.job_id: 
                 print("Error: job_id required for workers")
                 sys.exit(1)
-            asyncio.run(run_worker(args.job_id, args.index, args.total))
+            run_worker(args.job_id, args.index, args.total)
     except KeyboardInterrupt:
-        print("\n[!] Shutdown requested by user (Ctrl+C). Exiting gracefully...")
+        print("\n[!] Shutdown requested by user.")
         sys.exit(0)

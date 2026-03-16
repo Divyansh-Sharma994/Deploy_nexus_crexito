@@ -30,11 +30,8 @@ def decode_google_news_url(url: str) -> Optional[str]:
         pass
     return None
 
-async def resolve_google_news_url(url: str) -> str:
-    """
-    Tries to resolve the real URL behind a Google or Bing tracking link.
-    First tries decoding (Google only), then a fast HTTP redirect resolution.
-    """
+def resolve_google_news_url_sync(url: str) -> str:
+    """Synchronous version of resolve_google_news_url."""
     # 1. Try decoding (Instant, Google specific)
     if "news.google.com" in url:
         decoded = decode_google_news_url(url)
@@ -46,18 +43,14 @@ async def resolve_google_news_url(url: str) -> str:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         }
-        async with httpx.AsyncClient(follow_redirects=True, timeout=8) as client:
-            # HEAD is faster and often sufficient for resolving redirects
+        with httpx.Client(follow_redirects=True, timeout=8) as client:
             try:
-                resp = await client.head(url, headers=headers)
+                resp = client.head(url, headers=headers)
                 if resp.status_code < 400:
                     return str(resp.url)
             except: pass
             
-            # Fallback to GET if HEAD is blocked
-            resp = await client.get(url, headers=headers)
-            
-            # Bot detection or Rate Limit check (Google/Bing specific signals)
+            resp = client.get(url, headers=headers)
             if resp.status_code == 503 or "google.com/images/errors/robot.png" in resp.text:
                 return url
                 

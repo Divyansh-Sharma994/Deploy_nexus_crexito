@@ -4,9 +4,9 @@ from datetime import datetime, date
 from typing import Optional, List, Any, Dict
 from contextlib import asynccontextmanager
 
-from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean, Date, Float, ForeignKey, Index, select, update, delete, Table, JSON
+from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean, Date, Float, ForeignKey, Index, select, update, delete, Table, JSON, create_engine
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 # ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -41,6 +41,14 @@ else:
 
 engine = create_async_engine(get_database_url(), **engine_args)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+# Synchronous Engine for Workers
+def get_sync_url():
+    url = get_database_url()
+    return url.replace("+aiosqlite", "").replace("+asyncpg", "")
+
+engine_sync = create_engine(get_sync_url(), **engine_args)
+SessionLocalSync = sessionmaker(bind=engine_sync, expire_on_commit=False)
 
 # ─── Models ──────────────────────────────────────────────────────────────────
 
@@ -142,16 +150,23 @@ async def get_db():
         finally:
             await session.close()
 
-async def get_db_yield():
-    """FastAPI dependency injection yield."""
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
+from contextlib import contextmanager
+
+@contextmanager
+def get_db_sync():
+    """Synchronous context manager for gevent workers."""
+    session = SessionLocalSync()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+def init_db_sync():
+    Base.metadata.create_all(bind=engine_sync)
+    print(f"Sync Database initialized via SQLAlchemy ({engine_sync.url.drivername})")
 
 # Connection Lifecycle is handled via get_db and SessionMiddleware

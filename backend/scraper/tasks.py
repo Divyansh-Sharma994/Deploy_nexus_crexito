@@ -1,38 +1,10 @@
-import asyncio
 import logging
 import json
 from celery_app import app as celery_app
 from sqlalchemy import select, update
-from db.database import get_db, Article, ScrapeJob, AsyncSessionLocal
-
-import sys
+from db.database import get_db_sync, Article, ScrapeJob
 
 logger = logging.getLogger(__name__)
-
-def handle_loop_exception(loop, context):
-    exception = context.get("exception")
-    # Suppress WinError 10054 noise on Windows (ConnectionResetError)
-    if isinstance(exception, ConnectionResetError) or (exception and "[WinError 10054]" in str(exception)):
-        return
-    loop.default_exception_handler(context)
-
-def setup_event_loop():
-    """Ensure Proactor loop is used on Windows for Playwright."""
-    if sys.platform == 'win32':
-        try:
-            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-        except Exception as e:
-            logger.warning(f"Could not set Proactor policy: {e}")
-    
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    
-    # Silence Windows noise
-    loop.set_exception_handler(handle_loop_exception)
-    return loop
 
 # ─── Orchestrator Task ────────────────────────────────────────────────────────
 
@@ -40,75 +12,46 @@ def setup_event_loop():
 def run_scrape_task(self, job_id, sector, region, date_from, date_to, search_mode, user_id):
     """
     Orchestrator: Discovers URLs and dispatches independent scraping nodes.
+    Now fully synchronous for gevent compatibility.
     """
     logger.info(f"Starting Orchestrator for job {job_id}")
-    
     from scraper.engine import run_scrape_job
-    
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
     try:
-        loop.run_until_complete(
-            run_scrape_job(
-                job_id=job_id,
-                sector=sector,
-                region=region,
-                date_from=date_from,
-                date_to=date_to,
-                search_mode=search_mode,
-                user_id=user_id
-            )
+        run_scrape_job(
+            job_id=job_id,
+            sector=sector,
+            region=region,
+            date_from=date_from,
+            date_to=date_to,
+            search_mode=search_mode,
+            user_id=user_id
         )
         logger.info(f"Discovery phase for job {job_id} completed.")
     except Exception as e:
         logger.error(f"Orchestrator failed for job {job_id}: {e}")
         raise e
-    finally:
-        # C-7: Robust loop cleanup to allow background DB cleanups
-        try:
-            pending = asyncio.all_tasks(loop)
-            if pending:
-                loop.run_until_complete(asyncio.wait(pending, timeout=2.0))
-        except: pass
-        loop.close()
 
 # ─── Scraper Node (I/O Intensive) ─────────────────────────────────────────────
+
 @celery_app.task(name="scraper.tasks.scrape_article_node", bind=True, rate_limit="30/m", max_retries=3, default_retry_delay=10)
 def scrape_article_node(self, article_data, job_id, sector, region, user_id):
     """
     Task Node 1: Fetches HTML and extracts raw body. 
-    Now with retries for transient event loop or network errors.
+    Synchronous for gevent compatibility.
     """
     from scraper.engine import scrape_only, is_job_cancelled
-    
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-        
     try:
-        # C-X: Pre-emptive cancellation check
-        if loop.run_until_complete(is_job_cancelled(job_id)):
-            logger.info(f"Scrape task pre-emptively halted for job {job_id} [Reason: Job Cancelled/Global Stop]")
+        if is_job_cancelled(job_id):
+            logger.info(f"Scrape task halted for job {job_id} [Reason: Job Cancelled/Global Stop]")
             return None
 
-        article_id = loop.run_until_complete(
-            scrape_only(article_data, job_id, sector, region, user_id)
-        )
+        article_id = scrape_only(article_data, job_id, sector, region, user_id)
         if article_id:
             logger.info(f"Scraped raw content for article {article_id}. Triggering enrichment...")
-            # Chain the enrichment task
             enrich_article_node.delay(article_id)
     except Exception as e:
         logger.error(f"Scrape node failed for {article_data.get('url')}: {e}")
-        # Retry for transient errors (like event loop closure or shared browser timeouts)
         raise self.retry(exc=e)
-    finally:
-        try:
-            pending = asyncio.all_tasks(loop)
-            if pending:
-                loop.run_until_complete(asyncio.wait(pending, timeout=2.0))
-        except: pass
-        loop.close()
 
 # ─── Enrichment Node (Compute Intensive) ──────────────────────────────────────
 
@@ -116,55 +59,31 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id):
 def enrich_article_node(self, article_id):
     """
     Task Node 2: Performs AI analysis (Ollama/Groq).
-    If AI fails, only this node retries; raw content is already safe in DB.
+    Now synchronous to prevent event loop collisions.
     """
-    from scraper.llm import perform_full_enrichment
+    from scraper.llm import perform_full_enrichment_sync
+    from scraper.engine import is_job_cancelled
     
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    with get_db_sync() as db:
+        res = db.execute(select(Article).where(Article.id == article_id))
+        article = res.scalar_one_or_none()
+        if not article or not article.full_body: return
         
-    async def run_enrichment():
-        async with AsyncSessionLocal() as db:
-            # 1. Fetch raw article
-            res = await db.execute(select(Article).where(Article.id == article_id))
-            article = res.scalar_one_or_none()
-            if not article or not article.full_body:
-                return
-            
-            # C-X: Check for cancellation before AI compute
-            from scraper.engine import is_job_cancelled
-            if await is_job_cancelled(article.scrape_job_id):
-                logger.info(f"Enrichment cancelled for job {article.scrape_job_id}. Skipping article {article_id}")
-                return
+        if is_job_cancelled(article.scrape_job_id):
+            logger.info(f"Enrichment cancelled for job {article.scrape_job_id}. Skipping article {article_id}")
+            return
 
-            # 2. Run AI Logic
-            try:
-                enriched_data = await perform_full_enrichment(article.full_body, article.title, article.url, article.sector)
-                
-                # 3. Update Article
-                article.summary = enriched_data.get("summary")
-                article.sentiment = enriched_data.get("sentiment")
-                article.tags = enriched_data.get("tags")
-                if enriched_data.get("agency"):
-                    article.agency = enriched_data.get("agency")
-                if enriched_data.get("author"):
-                    article.author = enriched_data.get("author")
-                
-                await db.commit()
-                logger.info(f"Successfully enriched article {article_id}")
-            except Exception as ai_e:
-                logger.error(f"AI Enrichment failed for article {article_id}: {ai_e}")
-                raise ai_e
-
-    try:
-        loop.run_until_complete(run_enrichment())
-    except Exception as e:
-        # Retry logic for transient AI failures (e.g., rate limits)
-        raise self.retry(exc=e, countdown=60)
-    finally:
         try:
-            pending = asyncio.all_tasks(loop)
-            if pending:
-                loop.run_until_complete(asyncio.wait(pending, timeout=2.0))
-        except: pass
-        loop.close()
+            enriched_data = perform_full_enrichment_sync(article.full_body, article.title, article.url, article.sector)
+            
+            article.summary = enriched_data.get("summary")
+            article.sentiment = enriched_data.get("sentiment")
+            article.tags = enriched_data.get("tags")
+            if enriched_data.get("agency"): article.agency = enriched_data.get("agency")
+            if enriched_data.get("author"): article.author = enriched_data.get("author")
+            
+            db.commit()
+            logger.info(f"Successfully enriched article {article_id}")
+        except Exception as e:
+            logger.error(f"AI Enrichment failed for article {article_id}: {e}")
+            raise self.retry(exc=e, countdown=60)
