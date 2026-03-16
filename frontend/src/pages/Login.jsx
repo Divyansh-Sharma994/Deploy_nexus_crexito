@@ -168,7 +168,6 @@ const Login = () => {
             border: '1px solid var(--border)'
           }}
         >
-          <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/nui/google.svg" width="20" alt="Google" />
           Authorize via Google
         </button>
 
