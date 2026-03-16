@@ -68,7 +68,7 @@ def scrape_article_node(self, article_data, job_id, sector, region, user_id):
                 if resp.status_code == 200:
                     text_content = trafilatura.extract(resp.text)
                     # If we got a decent amount of text, we can skip Playwright!
-                    if text_content and len(text_content) > 1200:
+                    if text_content and len(text_content) > 400:
                         logger.info(f"Fast-track success for {resolved_url} ({len(text_content)} chars)")
                         html = resp.text
         except Exception as e:
