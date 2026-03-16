@@ -9,6 +9,7 @@ import ollama
 
 # --- Configuration ---
 GROQ_API_KEYS = [k.strip() for k in os.getenv("GROQ_API_KEY", "").split(",") if k.strip()]
+XAI_API_KEYS = [k.strip() for k in os.getenv("XAI_API_KEY", "").split(",") if k.strip()]
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "minimax-m2:cloud")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
@@ -43,8 +44,47 @@ def log(msg: str):
     from scraper.engine import logger
     logger.info(msg)
 
-# --- Groq Client ---
+# --- Grok (xAI) Client ---
+def summarize_with_grok_sync(text: str) -> Optional[str]:
+    """Summarizes article using xAI Grok API."""
+    is_placeholder = any("your_xai_api_key" in k.lower() for k in XAI_API_KEYS)
+    if not XAI_API_KEYS or is_placeholder or not text or len(text) < 100: 
+        return None
+    
+    url = "https://api.x.ai/v1/chat/completions"
+    payload = {
+        "model": "grok-beta", # robust and fast for summarization
+        "messages": [
+            {"role": "system", "content": "You are a news analyst. Summarize this article into EXACTLY 3 bullet points. Output only the bullet points."},
+            {"role": "user", "content": text[:5000]},
+        ],
+        "temperature": 0,
+    }
+
+    with httpx.Client(timeout=30) as client:
+        for attempt in range(2):
+            api_key = random.choice(XAI_API_KEYS)
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            try:
+                resp = client.post(url, headers=headers, json=payload, timeout=20)
+                if resp.status_code == 200: 
+                    return resp.json()["choices"][0]["message"]["content"]
+                else: 
+                    log(f"Grok API Error ({resp.status_code}): {resp.text}")
+                    if resp.status_code == 429: time.sleep(2)
+                    else: break
+            except Exception as e:
+                log(f"Grok Connection Error: {e}")
+                time.sleep(1)
+    return None
+
+# Compatibility wrapper for existing callers
 def summarize_with_groq_sync(text: str) -> Optional[str]:
+    # Prioritize Grok as requested by user
+    res = summarize_with_grok_sync(text)
+    if res: return res
+    
+    # Fallback to legacy Groq if key exists
     is_placeholder = any("your_groq_api_key" in k.lower() for k in GROQ_API_KEYS)
     if not GROQ_API_KEYS or is_placeholder or not text or len(text) < 400: return None
     
@@ -59,24 +99,15 @@ def summarize_with_groq_sync(text: str) -> Optional[str]:
     }
 
     with httpx.Client(timeout=30) as client:
-        for attempt in range(3):
-            r = get_redis_sync()
-            GROQ_LIMIT_KEY = "nexus:groq_global_throttle"
-            req_count = r.incr(GROQ_LIMIT_KEY)
-            if req_count == 1: r.expire(GROQ_LIMIT_KEY, 60)
-            
-            if req_count > 30:
-                time.sleep(1)
-                continue
-
+        for attempt in range(2):
             api_key = random.choice(GROQ_API_KEYS)
             headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
             try:
                 resp = client.post(url, headers=headers, json=payload, timeout=15)
                 if resp.status_code == 200: return resp.json()["choices"][0]["message"]["content"]
-                elif resp.status_code == 429: time.sleep(2 ** attempt)
+                elif resp.status_code == 429: time.sleep(1)
                 else: break
-            except: time.sleep(1)
+            except: pass
     return None
 
 # --- Ollama Client ---

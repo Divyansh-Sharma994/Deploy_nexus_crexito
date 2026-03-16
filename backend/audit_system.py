@@ -74,14 +74,20 @@ async def audit_system():
 
     # 3. AI Engine Audit
     print("\n[3/4] Auditing AI Enrichment Engines...")
-    from scraper.llm import GROQ_API_KEYS, OLLAMA_BASE_URL
-    
-    # Groq Check
-    is_placeholder = any("your_groq_api_key" in k.lower() for k in GROQ_API_KEYS)
-    if not GROQ_API_KEYS or is_placeholder:
-        print("  ⚠️ Groq API: UNCONFIGURED (Summarization disabled)")
+    # Grok (xAI) Check
+    from scraper.llm import XAI_API_KEYS, GROQ_API_KEYS, OLLAMA_BASE_URL
+    is_placeholder = any("your_xai_api_key" in k.lower() for k in XAI_API_KEYS)
+    if not XAI_API_KEYS or is_placeholder:
+        print("  ⚠️ Grok (xAI): UNCONFIGURED")
+        # Fallback check for Groq
+        from scraper.llm import GROQ_API_KEYS
+        is_groq_placeholder = any("your_groq_api_key" in k.lower() for k in GROQ_API_KEYS)
+        if GROQ_API_KEYS and not is_groq_placeholder:
+            print(f"  ℹ️  Legacy Groq Found: CONFIGURED ({len(GROQ_API_KEYS)} keys)")
+        else:
+            print("  ⚠️ Summarization Engine: TOTALLY DISABLED (No xAI or Groq keys)")
     else:
-        print(f"  ✅ Groq API: CONFIGURED ({len(GROQ_API_KEYS)} keys)")
+        print(f"  ✅ Grok (xAI): CONFIGURED ({len(XAI_API_KEYS)} keys)")
 
     # Ollama Check
     try:
