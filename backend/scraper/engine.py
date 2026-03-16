@@ -142,11 +142,14 @@ def discover_articles(keywords: List[str], day: date, geo: str, region_name: str
         current_proxy = ProxyGuard.get_healthy_proxy(proxy_pool)
         
         # Use official tbs parameters for time filtering (C-X)
+        # qdr:d = Past 24 hours (most reliable for recent news)
+        # sbd:1 = Sort by Date (newest first)
         is_today = day >= date.today()
         if is_today:
             tbs = "qdr:d,sbd:1"
         else:
-            # Format: cdr:1,cd_min:MM/DD/YYYY,cd_max:MM/DD/YYYY,sbd:1
+            # cdr:1 = Custom Date Range
+            # cd_min/max: MM/DD/YYYY
             date_str = day.strftime("%m/%d/%Y")
             tbs = f"cdr:1,cd_min:{date_str},cd_max:{date_str},sbd:1"
         
@@ -163,15 +166,28 @@ def discover_articles(keywords: List[str], day: date, geo: str, region_name: str
                     raise ProxyFailureError(f"HTTP {resp.status_code}")
                 if resp.status_code == 200:
                     feed = feedparser.parse(resp.text)
-                    for e in feed.entries:
-                        link = e.get("link")
-                        if not link or link in seen_urls: continue
-                        seen_urls.add(link)
-                        pub_date_str = day.isoformat()
-                        if "published_parsed" in e:
-                            try: pub_date_str = datetime(*e.published_parsed[:6]).isoformat()
-                            except: pass
-                        articles.append({"title": e.get("title", ""), "url": link, "published_at": pub_date_str, "agency": e.get("source", {}).get("title", "")})
+                    for entry in feed.entries:
+                        link = entry.link
+                        # Secondary safety: Google News RSS sometimes ignores tbs/cdr parameters
+                        # and returns very old results (as seen in user screenshots).
+                        # We verify the entry's timestamp if possible, but trust qdr:d more.
+                        if link not in seen_urls and (cumulative is None or link not in cumulative):
+                            parsed_date = None
+                            if hasattr(entry, 'published_parsed'):
+                                parsed_date = datetime.fromtimestamp(time.mktime(entry.published_parsed)).date()
+                            
+                            # If we have a date, strictly enforce it for historical scans.
+                            # For 'today' (qdr:d), we allow it since rolling 24h is fine.
+                            if not is_today and parsed_date and parsed_date != day:
+                                continue
+                                
+                            pub_date_str = day.isoformat()
+                            if hasattr(entry, 'published_parsed'):
+                                try: pub_date_str = datetime(*entry.published_parsed[:6]).isoformat()
+                                except: pass
+
+                            articles.append({"title": entry.title, "url": link, "published_at": pub_date_str, "agency": entry.source.title if hasattr(entry, 'source') else "Google News"})
+                            seen_urls.add(link)
                 else: resp.raise_for_status()
             except Exception as exc:
                 if attempt < 2: return fetch_rss(q, start_time, end_time, hl, ceid, attempt + 1)
