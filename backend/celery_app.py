@@ -1,6 +1,10 @@
 # MUST BE THE FIRST IMPORTS if using gevent in workers
 import os
+import sys
 import warnings
+
+# Ensure current directory is in sys.path for robust imports on Railway
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Suppress MonkeyPatchWarning as we manually handle the order
 try:
@@ -46,4 +50,5 @@ app.conf.update(
 )
 
 # Break circular import by discovering tasks after app is defined
-app.autodiscover_tasks(['scraper'])
+# We use the full task name to be safer
+app.autodiscover_tasks(['scraper'], related_name='tasks')

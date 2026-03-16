@@ -13,6 +13,7 @@ alembic>=1.13.0
 asyncpg>=0.29.0
 aiosqlite>=0.20.0
 redis>=5.0.0
+psycopg2-binary>=2.9.9
 
 # Scraper Engine
 playwright>=1.44.0
