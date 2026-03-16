@@ -277,14 +277,7 @@ async def discover_articles(keywords: List[str], day: date, geo: str, region_nam
     region_data = REGION_MAP.get(region_name.lower(), {"geo": "US", "cities": []})
     cities = region_data.get("cities", [])
     
-    windows = [
-        ("00:00:00", "03:00:00"), ("03:00:00", "06:00:00"), 
-        ("06:00:00", "09:00:00"), ("09:00:00", "12:00:00"),
-        ("12:00:00", "15:00:00"), ("15:00:00", "18:00:00"), 
-        ("18:00:00", "21:00:00"), ("21:00:00", "23:59:59")
-    ]
-
-    log(f"Starting 3-hour granular discovery for {day} ({region_name})")
+    log(f"Starting 24-hour discovery for {day} ({region_name})")
     
     # 1. Prepare global proxy pool once
     proxy_pool = load_proxies()
@@ -346,51 +339,48 @@ async def discover_articles(keywords: List[str], day: date, geo: str, region_nam
                     return await fetch_rss_with_rotation(q, start_time, end_time, attempt + 1)
                 log(f"Discovery fail for '{q}': {str(exc)[:50]}")
 
-    for start_t, end_t in windows:
+    # Determine languages to search in
+    search_languages = [{"code": "en-IN", "ceid": "IN:en"}]
+    if region_name.lower() == "india":
+        from scraper.config import INDIAN_LANGUAGES
+        search_languages = INDIAN_LANGUAGES
+
+    # Prepare queries
+    window_queries = []
+    is_brand_tracker = False
+    async with get_db() as db:
+        from db.database import ScrapeJob
+        job_res = await db.execute(select(ScrapeJob.sector).where(ScrapeJob.id == job_id))
+        sector_name = job_res.scalar()
+        if sector_name:
+            from db.database import WatchedBrand
+            brand_check = await db.execute(select(WatchedBrand).where(WatchedBrand.name == sector_name))
+            if brand_check.scalar_one_or_none():
+                is_brand_tracker = True
+
+    for kw in keywords:
+        window_queries.append(kw)
+        if not is_brand_tracker:
+            for mod in random.sample(SEARCH_MODIFIERS, min(len(SEARCH_MODIFIERS), 5)):
+                window_queries.append(f"{kw} {mod}")
+            if cities:
+                for city in random.sample(cities, min(len(cities), 2)):
+                    window_queries.append(f"{kw} {city}")
+
+    # Process queries across all supported languages for the FULL DAY (24h)
+    random.shuffle(window_queries)
+    start_t, end_t = "00:00:00", "23:59:59"
+    
+    for lang in search_languages:
         if await is_job_cancelled(job_id): break
-        log(f"Processing 3-hour window: {start_t} to {end_t}")
+        log(f"  [Discovery] Searching in language: {lang.get('name', lang['code'])} for full 24h window.")
         
-        # Determine languages to search in
-        search_languages = [{"code": "en-IN", "ceid": "IN:en"}]
-        if region_name.lower() == "india":
-            from scraper.config import INDIAN_LANGUAGES
-            search_languages = INDIAN_LANGUAGES
-
-        # Expand queries for this window
-        window_queries = []
-        is_brand_tracker = False
-        async with get_db() as db:
-            from db.database import ScrapeJob
-            job_res = await db.execute(select(ScrapeJob.sector).where(ScrapeJob.id == job_id))
-            sector_name = job_res.scalar()
-            if sector_name:
-                from db.database import WatchedBrand
-                brand_check = await db.execute(select(WatchedBrand).where(WatchedBrand.name == sector_name))
-                if brand_check.scalar_one_or_none():
-                    is_brand_tracker = True
-
-        for kw in keywords:
-            window_queries.append(kw)
-            # Only add modifiers/cities if NOT a brand tracker mission
-            if not is_brand_tracker:
-                for mod in random.sample(SEARCH_MODIFIERS, min(len(SEARCH_MODIFIERS), 5)):
-                    window_queries.append(f"{kw} {mod}")
-                if cities:
-                    for city in random.sample(cities, min(len(cities), 2)):
-                        window_queries.append(f"{kw} {city}")
-
-        # Process queries across all supported languages
-        random.shuffle(window_queries)
-        for lang in search_languages:
+        for i in range(0, len(window_queries), 5):
             if await is_job_cancelled(job_id): break
-            log(f"  [Discovery] Searching in language: {lang.get('name', lang['code'])}")
-            
-            for i in range(0, len(window_queries), 5):
-                if await is_job_cancelled(job_id): break
-                batch = window_queries[i:i+5]
-                tasks = [fetch_rss_with_rotation(q, start_t, end_t, hl=lang['code'], ceid=lang['ceid']) for q in batch]
-                await asyncio.gather(*tasks)
-                await asyncio.sleep(random.uniform(0.5, 1.5))
+            batch = window_queries[i:i+5]
+            tasks = [fetch_rss_with_rotation(q, start_t, end_t, hl=lang['code'], ceid=lang['ceid']) for q in batch]
+            await asyncio.gather(*tasks)
+            await asyncio.sleep(random.uniform(0.5, 1.5))
 
     log(f"Completed discovery for {day}. Unique articles found: {len(seen_urls)}")
     if cumulative is not None: cumulative.update(seen_urls)
