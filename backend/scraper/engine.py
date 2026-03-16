@@ -143,14 +143,15 @@ def discover_articles(keywords: List[str], day: date, geo: str, region_name: str
         if is_job_cancelled(job_id): return
         
         is_today = day >= date.today()
+        domain = "google.com" # standard for news
         if is_today:
-            tbs = "qdr:d,sbd:1"
+            # Format requested by user: q={query} when:1d
+            full_q = f"{q} when:1d"
+            rss_url = f"https://news.{domain}/rss/search?q={quote_plus(full_q)}&hl={hl}&gl=IN&ceid={ceid}"
         else:
             date_str = day.strftime("%m/%d/%Y")
             tbs = f"cdr:1,cd_min:{date_str},cd_max:{date_str},sbd:1"
-        
-        domain = REGION_MAP.get(geo, "google.com")
-        rss_url = f"https://news.{domain}/rss/search?q={quote_plus(q)}&hl={hl}&gl=IN&ceid={ceid}&tbs={quote_plus(tbs)}"
+            rss_url = f"https://news.{domain}/rss/search?q={quote_plus(q)}&hl={hl}&gl=IN&ceid={ceid}&tbs={quote_plus(tbs)}"
         
         try:
             xml_content = NetworkHandler.get_google_rss(rss_url)
@@ -182,28 +183,38 @@ def discover_articles(keywords: List[str], day: date, geo: str, region_name: str
             log(f"Discovery fail for '{q}': {exc}")
 
     search_languages = [{"code": "en-IN", "ceid": "IN:en"}]
-    if region_name.lower() == "india":
-        from scraper.config import INDIAN_LANGUAGES
-        search_languages = INDIAN_LANGUAGES
-
-    window_queries = [kw for kw in keywords]
-    is_brand_tracker = False
     with get_db_sync() as db:
         job_res = db.execute(select(ScrapeJob.sector).where(ScrapeJob.id == job_id))
-        sector_name = job_res.scalar()
-        if sector_name:
-            from db.database import WatchedBrand
-            if db.execute(select(WatchedBrand).where(WatchedBrand.name == sector_name)).scalar_one_or_none():
-                is_brand_tracker = True
+        sector_name = job_res.scalar() or "Technology"
+        
+        if region_name.lower() == "india":
+            from scraper.config import INDIAN_LANGUAGES
+            search_languages = INDIAN_LANGUAGES
+
+        # Base queries: Start with exact keywords provided
+        window_queries = [kw for kw in keywords]
+        
+        # ADD BRAND NAME (SECTOR) AS A SAFETY NET (captured broadly)
+        if sector_name and sector_name not in window_queries:
+            window_queries.append(sector_name)
+            # Also try brand + "India" for geo-specificity if it's the India region
+            if region_name.lower() == "india" and f"{sector_name} India" not in window_queries:
+                window_queries.append(f"{sector_name} India")
+
+        is_brand_tracker = False
+        from db.database import WatchedBrand
+        if db.execute(select(WatchedBrand).where(WatchedBrand.name == sector_name)).scalar_one_or_none():
+            is_brand_tracker = True
     
     if not is_brand_tracker:
         for kw in keywords:
-            for mod in random.sample(SEARCH_MODIFIERS, min(len(SEARCH_MODIFIERS), 5)): window_queries.append(f"{kw} {mod}")
+            for mod in random.sample(SEARCH_MODIFIERS, min(len(SEARCH_MODIFIERS), 5)): 
+                window_queries.append(f"{kw} {mod}")
     
     random.shuffle(window_queries)
     
-    # Discovery Acceleration: Parallelize with a small pool (avoid hitting semaphore too hard)
-    discovery_pool = Pool(3)
+    # Discovery Acceleration: Parallelize with a larger pool (now that we have a semaphore on network requests)
+    discovery_pool = Pool(10)
     for lang in search_languages:
         if is_job_cancelled(job_id): break
         for q in window_queries:
@@ -265,12 +276,23 @@ def scrape_only(article: dict, job_id: str, sector: str, region: str, user_id: s
         extracted_date = extract_date(content)
         if extracted_date: final_pub_at = extracted_date
 
-        if keywords and not verify_brand_relevance(f"{article['title']} {body}", keywords): body = None
+        if keywords:
+            # Check relevance more robustly: title is high priority
+            title_body = f"{article['title']} {body}"
+            # Brand Tracker: If the brand name (sector) or ANY keyword is found, it's relevant.
+            is_relevant = any(kw.lower() in title_body.lower() for kw in keywords)
+            if not is_relevant:
+                # If it's a brand tracker, also check the sector name itself just in case
+                if sector.lower() in title_body.lower():
+                    is_relevant = True
+            
+            if not is_relevant:
+                body = None
         
-        # 24h filter
+        # 48h filter (Relaxed from 24h to avoid nuking articles discovered by Google but slightly older)
         now = datetime.now()
         if final_pub_at.tzinfo: now = now.astimezone(final_pub_at.tzinfo)
-        date_invalid = (now - final_pub_at) > timedelta(hours=24)
+        date_invalid = (now - final_pub_at) > timedelta(hours=48)
 
         with get_db_sync() as db:
             if not body or date_invalid:
