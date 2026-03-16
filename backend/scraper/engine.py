@@ -146,11 +146,13 @@ def discover_articles(keywords: List[str], day: date, geo: str, region_name: str
         domain = "google.com" # standard for news
         if is_today:
             # Format requested by user: q={query} when:1d
+            # Note: Using quote() instead of quote_plus() to ensure space is %20 (strictly correct standard)
             full_q = f"{q} when:1d"
             rss_url = f"https://news.{domain}/rss/search?q={quote(full_q)}&hl={hl}&gl=IN&ceid={ceid}"
         else:
             date_str = day.strftime("%m/%d/%Y")
             tbs = f"cdr:1,cd_min:{date_str},cd_max:{date_str},sbd:1"
+            # Note: Using quote() instead of quote_plus() to ensure space is %20
             rss_url = f"https://news.{domain}/rss/search?q={quote(q)}&hl={hl}&gl=IN&ceid={ceid}&tbs={quote(tbs)}"
         
         try:
