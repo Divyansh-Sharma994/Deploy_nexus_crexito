@@ -45,8 +45,15 @@ app.conf.update(
     task_routes={
         "scraper.tasks.run_scrape_task": {"queue": "celery"},
         "scraper.tasks.scrape_article_node": {"queue": "celery"},
-        "scraper.tasks.enrich_article_node": {"queue": "enrichment"},
+        "scraper.tasks.enrich_article_node": {"queue": "celery"},
+        "scraper.tasks.complete_stale_jobs": {"queue": "celery"},
     },
+    beat_schedule={
+        "complete-stale-jobs-every-5-min": {
+            "task": "scraper.tasks.complete_stale_jobs",
+            "schedule": 5 * 60,  # Every 5 minutes
+        },
+    }
 )
 
 # Break circular import by discovering tasks after app is defined

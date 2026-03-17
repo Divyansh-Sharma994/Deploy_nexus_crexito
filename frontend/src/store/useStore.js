@@ -51,6 +51,36 @@ const useStore = create((set, get) => ({
     }
   },
 
+  deleteArticle: async (id) => {
+    try {
+      await api.delete(`/articles/${id}`);
+      set((state) => ({
+        articles: state.articles.filter((a) => a.id !== id),
+        totalArticles: Math.max(0, state.totalArticles - 1)
+      }));
+      return true;
+    } catch (err) {
+      console.error('Failed to delete article:', err);
+      return false;
+    }
+  },
+
+  deleteBulkArticles: async (params = {}) => {
+    try {
+      // Build query string for filters
+      const query = new URLSearchParams();
+      Object.entries(params).forEach(([key, val]) => {
+         if (val) query.append(key, val);
+      });
+      await api.delete(`/articles/bulk?${query.toString()}`);
+      set({ articles: [], totalArticles: 0 });
+      return true;
+    } catch (err) {
+      console.error('Failed to bulk delete articles:', err);
+      return false;
+    }
+  },
+
   logout: () => {
     localStorage.removeItem('token');
     set({ user: null, jobs: [], stats: null, articles: [] });

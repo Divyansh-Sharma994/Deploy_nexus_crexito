@@ -8,7 +8,9 @@ from typing import Optional, List, Dict, Any
 import ollama
 
 # --- Configuration ---
-GROQ_API_KEYS = [k.strip() for k in os.getenv("GROQ_API_KEY", "").split(",") if k.strip()]
+# Support GROQ_API_KEY or XAI_API_KEY (legacy name) for Groq credentials
+_groq_raw = os.getenv("GROQ_API_KEY") or os.getenv("XAI_API_KEY") or ""
+GROQ_API_KEYS = [k.strip() for k in _groq_raw.split(",") if k.strip()]
 XAI_API_KEYS = [k.strip() for k in os.getenv("XAI_API_KEY", "").split(",") if k.strip()]
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "minimax-m2:cloud")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -53,7 +55,7 @@ def summarize_with_grok_sync(text: str) -> Optional[str]:
     
     url = "https://api.x.ai/v1/chat/completions"
     payload = {
-        "model": "grok-beta", # robust and fast for summarization
+        "model": "grok-3",
         "messages": [
             {"role": "system", "content": "You are a news analyst. Summarize this article into EXACTLY 3 bullet points. Output only the bullet points."},
             {"role": "user", "content": text[:5000]},
@@ -80,35 +82,36 @@ def summarize_with_grok_sync(text: str) -> Optional[str]:
 
 # Compatibility wrapper for existing callers
 def summarize_with_groq_sync(text: str) -> Optional[str]:
-    # Prioritize Grok as requested by user
-    res = summarize_with_grok_sync(text)
-    if res: return res
-    
-    # Fallback to legacy Groq if key exists
+    # Primary: Groq (llama-3.3-70b-versatile) - fast and free tier friendly
     is_placeholder = any("your_groq_api_key" in k.lower() for k in GROQ_API_KEYS)
-    if not GROQ_API_KEYS or is_placeholder or not text or len(text) < 400: return None
-    
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    payload = {
-        "model": "llama-3.3-70b-versatile",
-        "messages": [
-            {"role": "system", "content": "You are a news analyst. Summarize this article into EXACTLY 3 bullet points. Output only the bullet points."},
-            {"role": "user", "content": text[:4000]},
-        ],
-        "max_tokens": 150,
-    }
+    if GROQ_API_KEYS and not is_placeholder and text and len(text) >= 100:
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        payload = {
+            "model": "llama-3.3-70b-versatile",
+            "messages": [
+                {"role": "system", "content": "You are a news analyst. Summarize this article into EXACTLY 3 bullet points. Output only the bullet points."},
+                {"role": "user", "content": text[:4000]},
+            ],
+            "max_tokens": 150,
+        }
 
-    with httpx.Client(timeout=30) as client:
-        for attempt in range(2):
-            api_key = random.choice(GROQ_API_KEYS)
-            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-            try:
-                resp = client.post(url, headers=headers, json=payload, timeout=15)
-                if resp.status_code == 200: return resp.json()["choices"][0]["message"]["content"]
-                elif resp.status_code == 429: time.sleep(1)
-                else: break
-            except: pass
-    return None
+        with httpx.Client(timeout=30) as client:
+            for attempt in range(2):
+                api_key = random.choice(GROQ_API_KEYS)
+                headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+                try:
+                    resp = client.post(url, headers=headers, json=payload, timeout=15)
+                    if resp.status_code == 200:
+                        return resp.json()["choices"][0]["message"]["content"]
+                    elif resp.status_code == 429:
+                        time.sleep(1)
+                    else:
+                        break
+                except:
+                    pass
+
+    # Optional fallback: Grok (xAI) - only runs if XAI_API_KEY is configured
+    return summarize_with_grok_sync(text)
 
 # --- Ollama Client ---
 from urllib.parse import urlparse
